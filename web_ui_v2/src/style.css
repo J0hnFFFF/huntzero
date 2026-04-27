@@ -1,0 +1,100 @@
+/* ═══════════════════════════════════════════════════════════════════
+   kimiSec Design System — CSS Variables & Global Styles
+   ═══════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;500;600&display=swap');
+
+:root {
+  /* ── Core Palette ── */
+  --bg-void: #010409;
+  --bg-panel: #0d1117;
+  --bg-card: #161b22;
+  --bg-input: #0d1117;
+  --bg-hover: #1c2128;
+
+  --border: #30363d;
+  --border-mid: #21262d;
+  --border-focus: #58a6ff;
+
+  /* ── Accent Colors ── */
+  --blue: #58a6ff;
+  --blue-dim: rgba(88, 166, 255, .12);
+  --purple: #d2a8ff;
+  --purple-dim: rgba(210, 168, 255, .12);
+  --green: #3fb950;
+  --green-dim: rgba(63, 185, 80, .12);
+  --yellow: #e3b341;
+  --yellow-dim: rgba(227, 179, 65, .12);
+  --red: #f85149;
+  --red-dim: rgba(248, 81, 73, .12);
+  --orange: #ffa657;
+  --orange-dim: rgba(255, 166, 87, .12);
+  --cyan: #39d2c0;
+  --cyan-dim: rgba(57, 210, 192, .12);
+
+  /* ── Text ── */
+  --text: #e6edf3;
+  --text-mid: #8b949e;
+  --text-dim: #484f58;
+
+  /* ── Typography ── */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'Fira Code', 'Cascadia Code', 'JetBrains Mono', monospace;
+
+  /* ── Sizing ── */
+  --header-h: 52px;
+  --sidebar-w: 220px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #app {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-void);
+  color: var(--text);
+  background-image:
+    radial-gradient(ellipse at 10% 0%, rgba(88, 166, 255, .04) 0%, transparent 50%),
+    radial-gradient(ellipse at 90% 100%, rgba(210, 168, 255, .03) 0%, transparent 50%);
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* ── Utility ── */
+.mono { font-family: var(--font-mono); }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Animations ── */
+@keyframes pulse-green {
+  0% { box-shadow: 0 0 0 0 rgba(63, 185, 80, .5); }
+  70% { box-shadow: 0 0 0 8px rgba(63, 185, 80, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-enter-active { animation: fade-in .25s ease-out; }
+.fade-leave-active { animation: fade-in .15s ease-in reverse; }

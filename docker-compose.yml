@@ -1,0 +1,79 @@
+services:
+
+  # ─── Redis 消息总线 & 状态库 ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: kimisec-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"           # 暴露给本机 OpenClaw / MCP 服务器使用
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── kimiSec Worker 集群（每个容器 = 一个独立 Hive-Mind 节点）──────────────
+  # 默认启动 3 个 Worker；使用 --scale worker=N 可动态扩缩容
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INSTALL_TREE_SITTER: "true"
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      KIMI_API_KEY:    "${KIMI_API_KEY}"           # 从宿主机 .env 文件读取
+      KIMI_REDIS_URL:  "redis://redis:6379/0"
+      KIMI_WORK_DIR:   "/data/workspace"
+      KIMI_WORKERS:    "${KIMI_WORKERS:-5}"        # 每个 Node 内部并发 Drone 数
+    volumes:
+      - ./workspace:/data/workspace                # bind mount: 宿主机可直接访问工作目录
+      - ./reports:/data/reports
+    tmpfs:
+      - /data/workspace/.drone_sandboxes:size=1G    # 沙盒在内存中，每 Worker 独立，不竞争 IO
+    deploy:
+      replicas: 3                                 # 默认 3 个 Worker 节点
+      resources:
+        limits:
+          memory: 4G        # 每个 Node 分配 4GB（可根据目标大小调整）
+          cpus: "4"
+        reservations:
+          memory: 1G
+          cpus: "1"
+    command: >
+      python kimi.py worker
+      --redis redis://redis:6379/0
+      --work-dir /data/workspace
+
+  # ─── 统一服务（MCP + HTTP，替代原 cluster-mcp + web 两个容器）──────────────
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      KIMI_API_KEY:    "${KIMI_API_KEY}"
+      KIMI_REDIS_URL:  "redis://redis:6379/0"
+    ports:
+      - "9999:9999"           # MCP TCP 端口
+      - "8080:8080"           # HTTP Web 控制台
+    volumes:
+      - ./web_ui/dist:/app/web_ui/dist:ro   # Vue 3 构建产物
+    command: >-
+      python kimi.py serve
+      --redis redis://redis:6379/0
+      --mcp-port 9999
+      --http-port 8080
+
+volumes:
+  redis_data:

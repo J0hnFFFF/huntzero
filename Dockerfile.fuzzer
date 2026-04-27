@@ -1,0 +1,22 @@
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during apt install
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    clang-18 llvm-18 \
+    libfuzzer-18-dev \
+    build-essential cmake ninja-build \
+    python3 python3-pip \
+    git wget curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Symlink clang-18 to clang
+RUN ln -s /usr/bin/clang-18 /usr/bin/clang && \
+    ln -s /usr/bin/clang++-18 /usr/bin/clang++
+
+ENV CC=clang
+ENV CXX=clang++
+
+WORKDIR /fuzz
+ENTRYPOINT ["/bin/bash"]

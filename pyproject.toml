@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clawdboz"
+# v3.0.0 — 架构级重构：Gateway + Ephemeral Worker 容器模型
+version = "3.0.0"
+description = "嗑唠的宝子 v3 — 飞书 AI 安全分析机器人（网关 + 弹性 Worker 架构）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Clawdboz Team", email = "clawdboz@example.com"}
+]
+keywords = ["feishu", "lark", "bot", "kimi", "ai", "mcp", "security", "serverless"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Security",
+]
+
+# 最小公共依赖（shared 模块使用）。
+# Gateway 和 Worker 各自使用专属的 requirements-*.txt。
+dependencies = [
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+# Gateway 服务所需依赖
+gateway = [
+    "lark-oapi>=1.5.0",
+    "aiohttp>=3.9.0",
+    "redis[asyncio]>=5.0.0",
+    "pyyaml>=6.0.0",
+    "docker>=7.0.0",
+    "croniter>=2.0.0",
+]
+# Worker 服务所需依赖
+worker = [
+    "aiohttp>=3.9.0",
+    "pyyaml>=6.0.0",
+    "kimi-agent-sdk",
+]
+# 开发工具
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
+]
+
+[project.scripts]
+# Gateway 启动入口
+clawdboz-gateway = "gateway.app:main"
+# Worker 启动入口（容器内使用 python -m worker.server，此处供调试用）
+clawdboz-worker = "worker.server:main"
+patchdiff = "patchdiff.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/clawdboz/clawdboz"
+Repository = "https://github.com/clawdboz/clawdboz"
+Documentation = "https://github.com/clawdboz/clawdboz/blob/main/README.md"
+Issues = "https://github.com/clawdboz/clawdboz/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gateway*", "worker*", "shared*", "feishu_tools*", "patchdiff*"]
+exclude = ["tests*", "docs*", "clawdboz*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml", "*.json", "*.md"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]  # black 已处理行长
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"

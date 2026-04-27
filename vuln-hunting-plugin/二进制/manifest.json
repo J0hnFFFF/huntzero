@@ -1,0 +1,57 @@
+{
+    "manifest_version": 1,
+    "name": "Binary Vulnerability Hunting",
+    "description": "专为二进制程序（ELF/PE/Mach-O）漏洞挖掘设计。集成 Rizin + rz-ghidra 实现“二进制转译”分析，通过语义审计与 Fuzzing 编排挖掘内存安全与逻辑漏洞。",
+    "version": "1.0.0",
+    "author": "john",
+    "agents": [
+        {
+            "path": ".agent/workflows/binary.md",
+            "name": "binary"
+        },
+        {
+            "path": ".agent/workflows/code-understander.md",
+            "name": "code-understander"
+        },
+        {
+            "path": ".agent/workflows/target-definer.md",
+            "name": "target-definer"
+        },
+        {
+            "path": ".agent/workflows/vuln-hunter.md",
+            "name": "vuln-hunter"
+        },
+        {
+            "path": ".agent/workflows/exploit-builder.md",
+            "name": "exploit-builder"
+        },
+        {
+            "path": ".agent/workflows/validator.md",
+            "name": "validator"
+        },
+        {
+            "path": ".agent/workflows/variant-analyzer.md",
+            "name": "variant-analyzer"
+        },
+        {
+            "path": ".agent/workflows/hypothesis-tester.md",
+            "name": "hypothesis-tester"
+        },
+        {
+            "path": ".agent/workflows/cve-reference.md",
+            "name": "cve-reference"
+        },
+        {
+            "path": ".agent/workflows/poc-generator.md",
+            "name": "poc-generator"
+        },
+        {
+            "path": ".agent/workflows/report-generator.md",
+            "name": "report-generator"
+        }
+    ],
+    "skills": [],
+    "hooks": [],
+    "commands": [],
+    "icon": "🧠"
+}

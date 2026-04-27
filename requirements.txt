@@ -1,0 +1,32 @@
+# kimiSec 核心运行依赖
+# ─────────────────────────────────────────────────────────────────────────────
+
+# LLM SDK（Moonshot Kimi）
+kimi-agent-sdk
+
+# 终端美化输出（CLI / Worker 日志）
+rich>=13.0
+
+# 配置文件解析
+pyyaml>=6.0
+
+# ─── 可选：分布式集群模式 ─────────────────────────────────────────────────────
+# Redis 客户端（同步 + 异步）；Worker 模式和 RedisBackend 需要
+redis[asyncio]>=5.0
+
+# ─── Web 管理控制台 ────────────────────────────────────────────────────────────
+# FastAPI + uvicorn：HTTP/WebSocket 服务器
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.0
+
+# ─── 可选：语义分析工具（tree-sitter）────────────────────────────────────────
+# 如不需要 Semantic Analyzer 功能可注释掉以减小镜像体积
+tree-sitter>=0.23
+tree-sitter-python
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-c
+tree-sitter-go
+tree-sitter-rust
+tree-sitter-java
