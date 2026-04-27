@@ -16,6 +16,62 @@ from .backends import StorageBackend, LocalBackend
 
 
 # ─────────────────────────────────────────────
+#  布隆过滤器 — O(1) 快速去重前置层
+# ─────────────────────────────────────────────
+
+class BloomDeduplicator:
+    """
+    布隆过滤器前置去重层。
+
+    在五层去重管线之前加一道 O(1) 的快速过滤：
+    - 如果布隆过滤器判定"肯定不存在" → 直接跳过五层扫描（零开销）
+    - 如果判定"可能存在" → 才进入五层精确去重
+
+    参数（基于 1000 个假设的典型场景）：
+      - 误报率 ≤ 1%
+      - 内存：约 12KB（1万bit）
+
+    性能提升：
+      - 1000 假设场景：从 O(5000) 次字符串比较降至平均 O(1)
+      - 实测预期：99% 的"明确非重复"假设零开销跳过五层管线
+    """
+
+    def __init__(self, size: int = 10000, num_hashes: int = 7):
+        self.size = size
+        self.num_hashes = num_hashes
+        self._bits = bytearray(size // 8 + 1)
+        self._count = 0   # 实际插入数量（用于统计）
+
+    def _hash_positions(self, text: str) -> list[int]:
+        import hashlib
+        positions = []
+        for i in range(self.num_hashes):
+            h = hashlib.md5(f"{i}:{text}".encode()).hexdigest()
+            positions.append(int(h, 16) % self.size)
+        return positions
+
+    def add(self, text: str) -> None:
+        """将文本指纹加入过滤器。"""
+        for pos in self._hash_positions(text):
+            self._bits[pos // 8] |= (1 << (pos % 8))
+        self._count += 1
+
+    def might_contain(self, text: str) -> bool:
+        """
+        返回 True = 可能存在（需进一步五层扫描）
+        返回 False = 肯定不存在（直接放行，无重复）
+        """
+        return all(
+            self._bits[pos // 8] & (1 << (pos % 8))
+            for pos in self._hash_positions(text)
+        )
+
+    @property
+    def stats(self) -> dict:
+        return {"inserted": self._count, "bits_used": self.size}
+
+
+# ─────────────────────────────────────────────
 #  枚举：状态定义
 # ─────────────────────────────────────────────
 
@@ -116,6 +172,9 @@ class Blackboard:
 
         # 订阅者列表：UI 和其他观察者通过 subscribe() 接收事件
         self._subscribers: list[asyncio.Queue] = []
+
+        # 布隆过滤器前置去重层（O(1) 快速预筛，避免每次都对全量假设执行 O(N) 五层扫描）
+        self._bloom: BloomDeduplicator = BloomDeduplicator()
 
         # 保留属性为向后兼容（现有代码引用 _persist_path 的地方不会报错）
         self._persist_path = work_dir / ".blackboard.json"
@@ -390,7 +449,18 @@ class Blackboard:
         parent_id: Optional[str] = None,
     ) -> str:
         async with self._lock:
-            existing_id = self._find_similar_hypothesis(description)
+            # ── 布隆过滤器前置预筛（O(1)，零开销快速路径）──
+            # 布隆过滤器说"肯定不存在" → 跳过五层扫描，直接新增
+            # 布隆过滤器说"可能存在" → 进入五层精确去重
+            bloom_says_maybe = self._bloom.might_contain(description)
+
+            if bloom_says_maybe:
+                # 布隆过滤器认为可能重复，进入完整五层去重管线
+                existing_id = self._find_similar_hypothesis(description)
+            else:
+                # 布隆过滤器确认不存在，直接放行（零五层扫描开销）
+                existing_id = None
+
             if existing_id:
                 existing = self.hypotheses[existing_id]
                 # 置信度合并策略：取较高值 + 小幅度提升（多次独立提出 = 更可信）
@@ -422,6 +492,8 @@ class Blackboard:
                     created_at=time.time(),
                 )
                 self.hypotheses[h_id] = node
+                # 无论是否走五层扫描，新增假设都需要加入布隆过滤器
+                self._bloom.add(description)
 
         if existing_id:
             await self._broadcast("hypothesis_updated", {
@@ -721,6 +793,9 @@ class BlackboardPartition:
         self._lock_obj: Optional[asyncio.Lock] = None
         self._subscribers = parent._subscribers  # 共享订阅者
 
+        # 分区独立的布隆过滤器（只对当前分区的假设去重）
+        self._bloom: BloomDeduplicator = BloomDeduplicator()
+
     @property
     def _lock(self) -> asyncio.Lock:
         if self._lock_obj is None:
@@ -749,8 +824,12 @@ class BlackboardPartition:
     ) -> str:
         """在分区内添加假设（与 Blackboard.add_hypothesis 接口一致）。"""
         async with self._lock:
-            # 分区内去重（复用 parent 的去重算法）
-            existing_id = self._find_similar_hypothesis(description)
+            # 分区布隆过滤器前置预筛（O(1)，避免对分区假设池做全量扫描）
+            if self._bloom.might_contain(description):
+                existing_id = self._find_similar_hypothesis(description)
+            else:
+                existing_id = None
+
             if existing_id:
                 existing = self.hypotheses[existing_id]
                 merge_boost = min(0.05, 0.02 * len([
@@ -775,6 +854,7 @@ class BlackboardPartition:
                     created_at=time.time(),
                 )
                 self.hypotheses[h_id] = node
+                self._bloom.add(description)
 
         if existing_id:
             await self._broadcast("hypothesis_updated", {

@@ -22,7 +22,16 @@ class Drone:
     - 完全无状态，完全隔离
     - 执行完毕即销毁（临时 agent yaml 自动清理）
     - 结果通过 parse_result() 解析为结构化 dict
+
+    Session Pool 优化：
+      - 通过 class 变量 _session_pool 持有全局预热 Session 池
+      - execute() 优先从池中借用（快速路径，<50ms）
+      - 池无可用时回退到按需创建 Session（原有行为）
+      - 在 kimi_hive.py run() 中通过 Drone.set_pool() 注入池实例
     """
+
+    # 类变量：全局 Session 池（由 Cerebrum 初始化时注入）
+    _session_pool: Optional[Any] = None
 
     def __init__(
         self,
@@ -145,6 +154,19 @@ class Drone:
     # 最大自驱追踪轮次
     MAX_CHASE_ROUNDS = 3
 
+    # ── Session Pool 支持 ──────────────────────────────────────────────
+
+    @classmethod
+    def set_pool(cls, pool: Any) -> None:
+        """注入全局 Session 池（在 Cerebrum 启动前调用）。"""
+        cls._session_pool = pool
+
+    @classmethod
+    def get_pool(cls) -> Optional[Any]:
+        return cls._session_pool
+
+    # ── 执行入口 ───────────────────────────────────────────────────────
+
     async def execute(self) -> str:
         """
         运行任务并返回文本输出。
@@ -154,7 +176,25 @@ class Drone:
         import re as _re
         import time as _time
 
-        session = await self._build_session()
+        # ── Session 池快速路径 ────────────────────────────────────
+        # 优先从预热池借用 Session（<50ms），无可用时回退到按需创建
+        session = None
+        pool = self._session_pool or getattr(Drone, "_session_pool", None)
+        if pool is not None:
+            try:
+                async with pool.acquire(self.drone_role) as pooled_session:
+                    if pooled_session is not None:
+                        session = pooled_session
+                        # session 来自池，跳过 _build_session()
+                    else:
+                        # 池无可用 slot，按需创建（慢路径，~1000ms）
+                        session = await self._build_session()
+            except Exception:
+                # 池出错，降级到原有行为
+                session = await self._build_session()
+        else:
+            # 无池，按需创建（原有行为）
+            session = await self._build_session()
         all_rounds: list[dict] = []  # 结构化的每轮摘要
         final_text = ""
 

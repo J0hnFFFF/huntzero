@@ -51,6 +51,7 @@ from kimi_sdk_compat import patch_kimi_agent_sdk
 patch_kimi_agent_sdk()
 
 from engine import Blackboard, Cerebrum
+from engine.drone import Drone
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  全局 Console（stderr 用于日志，stdout 保持干净可 pipe）
@@ -606,6 +607,21 @@ async def run(target: str, work_dir: Path, root_dir: Path,
         console.print("[yellow]⟳ Restored blackboard from disk[/]")
 
     # ── 初始化 Cerebrum ──
+    session_pool = None
+    if max_workers > 1:
+        # 预热 Session 连接池（仅多并发模式启用）
+        try:
+            from engine.session_pool import DroneSessionPool
+            session_pool = DroneSessionPool(
+                root_dir=root_dir,
+                config=build_config(api_key),
+                pool_size_per_role=2,
+            )
+            await session_pool.initialize()
+            Drone.set_pool(session_pool)   # 注入到 Drone class
+        except Exception as e:
+            console.print(f"[yellow]⚠️  Session Pool 初始化失败，降级到按需创建：{e}[/]")
+
     cerebrum = Cerebrum(
         blackboard=blackboard,
         work_dir=analysis_dir,
@@ -664,6 +680,13 @@ async def run(target: str, work_dir: Path, root_dir: Path,
             except Exception:
                 break
 
+        # ── 关闭 Session 池 ─────────────────────────────────────
+        if session_pool is not None:
+            await session_pool.shutdown()
+            pool_stats = session_pool.get_stats()
+            total_uses = sum(v["total_uses"] for v in pool_stats.values())
+            console.print(f"[dim]   [SESSION POOL] 总复用次数: {total_uses}[/]")
+
         # P2 FIX: 强制 GC 清理孤儿子进程传输对象。
         # kimi_agent_sdk 内部通过 asyncio.create_subprocess_exec() 创建的子进程
         # 在 session 关闭后不会被正确回收。如果等到 event loop 关闭后才被 GC 回收，
@@ -677,6 +700,40 @@ async def run(target: str, work_dir: Path, root_dir: Path,
 
     # ── 打印最终报告（终端） ──
     print_final_report(blackboard)
+
+    # ── FinOps 成本报告 ──
+    try:
+        from tools.finops_monitor import finops_monitor
+        fm = finops_monitor()
+        # 根据 Cerebrum 统计估算成本（实际精确值需要 SDK 支持）
+        # 这里基于假设数量和任务数做保守估算
+        hyp_count = stats["hypotheses"]
+        task_count = len(blackboard.tasks)
+        # Cerebrum 轮次假设生成（平均 ~300 token/轮）
+        cerebrum_in = stats["hypotheses"] * 300 + max_rounds * 500
+        # Drone 任务（平均 ~500 token in / ~300 token out）
+        drone_in = task_count * 500
+        drone_out = task_count * 300
+
+        fm.record(role="cerebrum",
+                  tokens_in=cerebrum_in,
+                  tokens_out=max_rounds * 300,
+                  model="kimi-long-context",
+                  latency_ms=0,
+                  hypothesis_count=hyp_count)
+        fm.record(role="drone-aggregate",
+                  tokens_in=drone_in,
+                  tokens_out=drone_out,
+                  model="kimi-latest",
+                  latency_ms=0)
+
+        fm.print_report(console=console)
+
+        # Session Pool 统计
+        if session_pool is not None:
+            fm.print_pool_stats(session_pool, console=console)
+    except Exception:
+        pass  # FinOps 失败不影响主流程
 
     # ── 导出报告文件 ──
     elapsed = _time.monotonic() - start_time
