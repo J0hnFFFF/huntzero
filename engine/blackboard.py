@@ -43,11 +43,24 @@ class BloomDeduplicator:
         self._count = 0   # 实际插入数量（用于统计）
 
     def _hash_positions(self, text: str) -> list[int]:
-        import hashlib
+        """
+        使用 FNV-1a 哈希生成多个独立的哈希位置。
+        FNV-1a 比 MD5 加盐有更好的独立性和均匀分布，适合布隆过滤器。
+        """
+        # FNV-1a 常数（64位）
+        FNV_OFFSET_BASIS = 0xcbf29ce484222325
+        FNV_PRIME = 0x100000001b3
+
+        encoded = text.encode("utf-8")
         positions = []
         for i in range(self.num_hashes):
-            h = hashlib.md5(f"{i}:{text}".encode()).hexdigest()
-            positions.append(int(h, 16) % self.size)
+            # 每个哈希函数使用不同的种子（通过改变初始 offset 实现独立）
+            h = FNV_OFFSET_BASIS ^ (i * 0xff)
+            h = (h * FNV_PRIME) & 0xffffffffffffffff
+            for byte in encoded:
+                h ^= byte
+                h = (h * FNV_PRIME) & 0xffffffffffffffff
+            positions.append(h % self.size)
         return positions
 
     def add(self, text: str) -> None:
@@ -130,8 +143,190 @@ class Finding:
     evidence:       str
     created_at:     float = 0.0
     sector_id:      Optional[str] = None   # 分区标识（大型项目按 Sector 分析时设置）
+    # PoC 验证字段
+    poc_status:     str = "pending"        # pending | generated | verified_success | verified_failed | error
+    poc_output:     Optional[str] = None   # PoC 执行输出
+    poc_verified_at: Optional[float] = None  # 验证时间戳
+    # 利用前置条件（Exploit Prerequisites）
+    prerequisites:  Optional["ExploitPrerequisites"] = None  # 利用所需的前置条件
 
 
+@dataclass
+class ExploitPrerequisites:
+    """
+    利用前置条件元组。
+
+    在报告利用漏洞时，明确标注利用该漏洞所需的前置条件，
+    帮助区分"理论可利用"和"实际可利用"的漏洞。
+    """
+    auth_required: bool = False               # 是否需要认证
+    network_access: str = "external"         # 网络位置：external | internal | localhost
+    privilege_level: str = "none"            # 所需权限：none | user | admin | system
+    env_configs: list[str] = field(default_factory=list)   # 所需配置项（如 debug=true）
+    cve_dependencies: list[str] = field(default_factory=list)  # 依赖的其他 CVE
+    tool_requirements: list[str] = field(default_factory=list)  # 所需工具（如 ysoserial）
+    is_satisfiable: bool = True               # 当前目标是否满足这些条件
+    unmet_conditions: list[str] = field(default_factory=list)  # 不满足的条件列表
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  贝叶斯置信度传播引擎（可学习版本）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BayesianConfidenceEngine:
+    """
+    沿 Hypothesis 父子链传播置信度（贝叶斯推理）+ 从历史数据学习因果强度。
+    
+    使用方法：
+        engine = BayesianConfidenceEngine(blackboard.hypotheses, strength_path=work_dir)
+        updated_count = engine.update_confidences()
+        engine.record_outcome("H-ABC123", confirmed=True)  # PoC 验证触发学习
+        engine.save()
+    """
+
+    DEFAULT_STRENGTH = 0.85
+    LAPLACE_ALPHA = 1.0
+    MIN_SAMPLES_TO_USE_LEARNED = 3
+
+    def __init__(
+        self,
+        hypotheses: dict,
+        strength_path: "Path" = None,
+        strength_matrix: "dict" = None,
+    ):
+        self.hypotheses = hypotheses
+        self.strength_matrix: dict = strength_matrix or {}
+        self._strength_path = strength_path
+        self._outcomes: list = []
+        if strength_path:
+            loaded = self._load_from_file(strength_path)
+            if loaded:
+                self.strength_matrix.update(loaded)
+
+    def _get_strength(self, parent_id: str, child_id: str) -> float:
+        key = f"{parent_id}->{child_id}"
+        if key not in self.strength_matrix:
+            return self.DEFAULT_STRENGTH
+        entry = self.strength_matrix[key]
+        if isinstance(entry, dict) and entry.get("n", 0) >= self.MIN_SAMPLES_TO_USE_LEARNED:
+            return entry["strength"]
+        return self.DEFAULT_STRENGTH
+
+    def record_outcome(self, h_id: str, confirmed: bool) -> None:
+        h = self.hypotheses.get(h_id)
+        if not h:
+            return
+        record = {"h_id": h_id, "confirmed": confirmed, "parent_id": h.parent_id}
+        record["_idx"] = len(self._outcomes)
+        self._outcomes.append(record)
+        if h.parent_id:
+            self._update_strength_for_pair(h.parent_id, h_id, confirmed)
+
+    def _update_strength_for_pair(self, parent_id: str, child_id: str, child_confirmed: bool) -> None:
+        key = f"{parent_id}->{child_id}"
+        parent_records = [r for r in self._outcomes if r["h_id"] == parent_id]
+        child_records  = [r for r in self._outcomes if r["h_id"] == child_id]
+        if not parent_records or not child_records:
+            return
+        parent_time = max((r.get("_idx", 0) for r in parent_records), default=0)
+        child_after = [r for r in child_records if r.get("_idx", 0) >= parent_time]
+        n_confirmed = sum(1 for r in child_after if r["confirmed"])
+        n_total     = len(child_after)
+        n_child_total     = len(child_records)
+        n_child_confirmed = sum(1 for r in child_records if r["confirmed"])
+        base_rate = (n_child_confirmed + self.LAPLACE_ALPHA) / (n_child_total + 2 * self.LAPLACE_ALPHA)
+        if n_total > 0:
+            conditional = (n_confirmed + self.LAPLACE_ALPHA) / (n_total + 2 * self.LAPLACE_ALPHA)
+            strength = min(1.0, max(0.0, conditional / base_rate)) if base_rate > 0 else self.DEFAULT_STRENGTH
+        else:
+            strength = min(1.0, max(0.0, base_rate))
+        existing = self.strength_matrix.get(key, {"strength": self.DEFAULT_STRENGTH, "n": 0})
+        new_n = existing.get("n", 0) + 1
+        self.strength_matrix[key] = {
+            "strength": round(strength, 4),
+            "n": new_n,
+            "base_rate": round(base_rate, 4),
+        }
+
+    def learn_from_outcomes(self, outcomes: list) -> dict:
+        self._outcomes = []
+        for idx, rec in enumerate(outcomes):
+            rec["_idx"] = idx
+            self._outcomes.append(rec)
+            if rec.get("parent_id"):
+                self._update_strength_for_pair(rec["parent_id"], rec["h_id"], rec["confirmed"])
+        return self.strength_matrix
+
+    def save(self) -> bool:
+        if not self._strength_path:
+            return False
+        try:
+            path = Path(self._strength_path)
+            path.mkdir(parents=True, exist_ok=True)
+            fpath = path / ".bayesian_strength.json"
+            data = {
+                "strength_matrix": self.strength_matrix,
+                "meta": {"total_outcomes": len(self._outcomes), "default_strength": self.DEFAULT_STRENGTH}
+            }
+            fpath.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+    def _load_from_file(self, path) -> dict:
+        try:
+            fpath = Path(path) / ".bayesian_strength.json"
+            if fpath.exists():
+                return json.loads(fpath.read_text(encoding="utf-8")).get("strength_matrix", {})
+        except Exception:
+            pass
+        return {}
+
+    def _propagate_single(self, h_id: str, visited: set) -> float:
+        if h_id in visited:
+            return 0.0
+        visited.add(h_id)
+        h = self.hypotheses.get(h_id)
+        if not h:
+            return 0.0
+        if not h.parent_id:
+            return h.confidence
+        parent_conf = self._propagate_single(h.parent_id, visited.copy())
+        strength = self._get_strength(h.parent_id, h_id)
+        propagated = parent_conf * strength
+        return 0.6 * propagated + 0.4 * h.confidence
+
+    def propagate_all(self) -> dict:
+        return {
+            h_id: min(1.0, max(0.0, self._propagate_single(h_id, set())))
+            for h_id in self.hypotheses
+        }
+
+    def update_confidences(self) -> int:
+        posteriors = self.propagate_all()
+        updated = 0
+        for h_id, posterior in posteriors.items():
+            if h_id in self.hypotheses:
+                old = self.hypotheses[h_id].confidence
+                self.hypotheses[h_id].confidence = posterior
+                if abs(old - posterior) > 0.01:
+                    updated += 1
+        return updated
+
+    def get_strength_stats(self) -> dict:
+        learned = sum(
+            1 for v in self.strength_matrix.values()
+            if isinstance(v, dict) and v.get("n", 0) >= self.MIN_SAMPLES_TO_USE_LEARNED
+        )
+        return {
+            "total_pairs": len(self.strength_matrix),
+            "learned_pairs": learned,
+            "outcomes_in_memory": len(self._outcomes),
+            "default_strength": self.DEFAULT_STRENGTH,
+        }
 # ─────────────────────────────────────────────
 #  Blackboard 核心
 # ─────────────────────────────────────────────
@@ -495,13 +690,18 @@ class Blackboard:
                 # 无论是否走五层扫描，新增假设都需要加入布隆过滤器
                 self._bloom.add(description)
 
-        if existing_id:
-            await self._broadcast("hypothesis_updated", {
-                "id": existing_id, "confidence": self.hypotheses[existing_id].confidence,
-                "note": "merged_duplicate",
-            })
-        else:
-            await self._broadcast("hypothesis_added", asdict(self.hypotheses[h_id]))
+            # 在锁内 snapshot 需要广播的数据，避免锁外读取被并发修改
+            broadcast_data = None
+            if existing_id:
+                broadcast_data = {
+                    "id": existing_id,
+                    "confidence": self.hypotheses[existing_id].confidence,
+                    "note": "merged_duplicate",
+                }
+                await self._broadcast("hypothesis_updated", broadcast_data)
+            else:
+                broadcast_data = asdict(self.hypotheses[h_id])
+                await self._broadcast("hypothesis_added", broadcast_data)
         self._persist()
         return h_id
 
@@ -528,17 +728,22 @@ class Blackboard:
         async with self._lock:
             # ── 任务防重入去重 (Task Deduplication) ──
             # 防止 LLM 在多轮交互中重复下发相同的排查任务
+            # 注意：仅在同一 hypothesis_id 下做去重，避免跨假设误杀
             import re
             def _simplify(t: str) -> str:
                 return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', t.lower())
             
             new_simple = _simplify(description)
             for existing_task in self.tasks.values():
+                # 仅在同一假设下检查，防止跨假设误杀
+                if existing_task.hypothesis_id != hypothesis_id:
+                    continue
                 if existing_task.drone_role == drone_role:
                     ex_simple = _simplify(existing_task.description)
-                    # 简单的包含或高相似度匹配
-                    if new_simple in ex_simple or ex_simple in new_simple:
-                        # 已经存在相似的任务（不管其挂在哪个假说下，也不管其是否执行失败/超时），直接全局拦截
+                    # 包含匹配（注意：只有长度差异大才用，小幅差异不算）
+                    if new_simple in ex_simple and len(ex_simple) - len(new_simple) <= 10:
+                        return None
+                    if ex_simple in new_simple and len(new_simple) - len(ex_simple) <= 10:
                         return None
 
             t_id = f"T-{uuid.uuid4().hex[:6].upper()}"
@@ -710,33 +915,149 @@ class Blackboard:
             lines.append("")
         self._backend.write_audit_notes(self._node_id, "\n".join(lines))
 
+    def export_exploit_chain_graph(self, output_path: Path) -> bool:
+        """
+        导出利用链图为 DOT 格式（可用 graphviz 渲染为 PNG/SVG）。
+        节点：Hypothesis（按 severity 着色）
+        边：parent_id 父子关系 + evidence 关联
+        """
+        try:
+            lines = ["digraph ExploitChains {"]
+            lines.append('  rankdir=LR;')
+            lines.append('  node [shape=box, style=filled, fontname="Arial"];')
+            lines.append('  edge [fontname="Arial", fontsize=10];')
+            lines.append("")
+
+            # 颜色映射
+            color_map = {
+                "critical": "red",
+                "high": "orange",
+                "medium": "yellow",
+                "low": "lightblue",
+                "none": "gray",
+            }
+
+            # 节点
+            for h_id, h in self.hypotheses.items():
+                if h.status.value not in ("active", "suspected", "confirmed"):
+                    continue
+                color = color_map.get(h.severity if hasattr(h, 'severity') else "none", "gray")
+                label = h.description[:50].replace('"', "'").replace("\n", " ")
+                lines.append(f'  "{h_id}" [label="{label}", fillcolor="{color}", fontcolor=black];')
+
+            lines.append("")
+
+            # 边（父子关系）
+            for h_id, h in self.hypotheses.items():
+                if h.parent_id and h.parent_id in self.hypotheses:
+                    lines.append(f'  "{h.parent_id}" -> "{h_id}";')
+
+            lines.append("")
+            lines.append('  // Findings as double-circle nodes')
+            for f in self.findings:
+                f_node = f"F-{f.id}"
+                lines.append(f'  "{f_node}" [label="FINDING: {f.title[:30]}", shape=doublecircle, fillcolor=red];')
+                if f.hypothesis_id in self.hypotheses:
+                    lines.append(f'  "{f.hypothesis_id}" -> "{f_node}" [style=bold, color=red];')
+
+            lines.append("}")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("\n".join(lines), encoding="utf-8")
+            return True
+        except Exception as e:
+            print(f"[export_exploit_chain_graph] Error: {e}")
+            return False
+
+    def export_graphml(self, output_path: Path) -> bool:
+        """
+        导出利用链图为 GraphML 格式（可用 yEd、Cytoscape 打开）。
+        """
+        try:
+            lines = ['<?xml version="1.0" encoding="UTF-8"?>']
+            lines.append('<graphml xmlns="http://graphml.graphdrawing.org/xmlns"')
+            lines.append('           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"')
+            lines.append('           xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns')
+            lines.append('           http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">')
+            lines.append('  <key id="label" for="node" attr.name="label" attr.type="string"/>')
+            lines.append('  <key id="color" for="node" attr.name="color" attr.type="string"/>')
+            lines.append('  <key id="severity" for="node" attr.name="severity" attr.type="string"/>')
+            lines.append('  <key id="edge_label" for="edge" attr.name="label" attr.type="string"/>')
+            lines.append('  <graph id="ExploitChains" edgedefault="directed">')
+
+            # 节点
+            for h_id, h in self.hypotheses.items():
+                if h.status.value not in ("active", "suspected", "confirmed"):
+                    continue
+                label = h.description[:50].replace('&', '&amp;').replace('"', '&quot;')
+                lines.append(f'    <node id="{h_id}">')
+                lines.append(f'      <data key="label">{label}</data>')
+                lines.append(f'      <data key="severity">{h.status.value}</data>')
+                lines.append(f'    </node>')
+
+            # 边
+            edge_id = 0
+            for h_id, h in self.hypotheses.items():
+                if h.parent_id and h.parent_id in self.hypotheses:
+                    lines.append(f'    <edge id="e{edge_id}" source="{h.parent_id}" target="{h_id}">')
+                    lines.append(f'      <data key="edge_label">parent-child</data>')
+                    lines.append(f'    </edge>')
+                    edge_id += 1
+
+            lines.append('  </graph>')
+            lines.append('</graphml>')
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("\n".join(lines), encoding="utf-8")
+            return True
+        except Exception as e:
+            print(f"[export_graphml] Error: {e}")
+            return False
+
 
     def load(self):
-        """从后端恢复状态（支持本地 JSON 和 Redis 两种模式）。"""
+        """
+        从后端恢复状态（支持本地 JSON 和 Redis 两种模式）。
+        使用原子加载策略：先解析到临时变量，成功后再替换实例状态，
+        避免半加载状态（JSON 损坏时不会污染现有对象）。
+        """
         data = self._backend.load(self._node_id)
         if not data:
             return
+
+        # 原子加载：先解析到临时容器，验证成功后再替换
+        tmp_hypotheses: dict[str, HypothesisNode] = {}
+        tmp_tasks: dict[str, DroneTask] = {}
+        tmp_findings: list[Finding] = []
+
         try:
-            self.target = data.get("target", "")
             for h_id, h in data.get("hypotheses", {}).items():
-                h["status"] = HypothesisStatus(h["status"])
-                self.hypotheses[h_id] = HypothesisNode(
-                    **{k: v for k, v in h.items()
+                h_copy = dict(h)
+                h_copy["status"] = HypothesisStatus(h_copy["status"])
+                tmp_hypotheses[h_id] = HypothesisNode(
+                    **{k: v for k, v in h_copy.items()
                        if k in HypothesisNode.__dataclass_fields__}
                 )
             for t_id, t in data.get("tasks", {}).items():
-                t["status"] = TaskStatus(t["status"])
-                self.tasks[t_id] = DroneTask(
-                    **{k: v for k, v in t.items()
+                t_copy = dict(t)
+                t_copy["status"] = TaskStatus(t_copy["status"])
+                tmp_tasks[t_id] = DroneTask(
+                    **{k: v for k, v in t_copy.items()
                        if k in DroneTask.__dataclass_fields__}
                 )
             for f in data.get("findings", []):
-                self.findings.append(
+                tmp_findings.append(
                     Finding(**{k: v for k, v in f.items()
                                if k in Finding.__dataclass_fields__})
                 )
-        except Exception:
-            pass
+
+            # 所有解析成功后才替换，避免半加载状态
+            self.target = data.get("target", "")
+            self.hypotheses = tmp_hypotheses
+            self.tasks = tmp_tasks
+            self.findings = tmp_findings
+        except Exception as e:
+            import sys
+            print(f"[Blackboard.load] 状态恢复失败，数据可能已损坏: {e}", file=sys.stderr)
 
     def emit_global(self, event_type: str, data: Any = None) -> None:
         """向全局事件总线（Redis Pub/Sub 等）发布遊测事件。本地模式下为 no-op。"""

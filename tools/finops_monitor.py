@@ -105,6 +105,7 @@ class FinOpsMonitor:
         self.records: list[CallRecord] = []
         self._call_count_window: list[float] = []   # 用于流量激增检测
         self._alert_triggered = False
+        self._large_call_warned = False              # Issue-17 修复：在 __init__ 中统一初始化
 
     def record(
         self,
@@ -348,6 +349,19 @@ def get_finops() -> FinOpsMonitor:
     return _finops_instance
 
 
+def get_monitor() -> FinOpsMonitor:
+    """获取全局 FinOps 监控器单例（推荐使用此名称，避免与类名 FinOpsMonitor 混淆）。"""
+    return get_finops()
+
+
 def finops_monitor() -> FinOpsMonitor:
-    """别名，便于 from tools.finops_monitor import finops_monitor"""
+    """
+    [已废弃] 请改用 get_monitor()。
+    此别名仅作向后兼容保留。
+    """
+    import sys
+    print(
+        "Warning: finops_monitor() 已废弃，请使用 get_monitor() 替代。",
+        file=sys.stderr,
+    )
     return get_finops()

@@ -703,21 +703,22 @@ async def run(target: str, work_dir: Path, root_dir: Path,
 
     # ── FinOps 成本报告 ──
     try:
-        from tools.finops_monitor import finops_monitor
-        fm = finops_monitor()
-        # 根据 Cerebrum 统计估算成本（实际精确值需要 SDK 支持）
-        # 这里基于假设数量和任务数做保守估算
+        from tools.finops_monitor import get_monitor
+        fm = get_monitor()
+        # Bug-19 修复：stats 必须在 try 块内通过 blackboard.stats() 获取
+        stats = blackboard.stats()
         hyp_count = stats["hypotheses"]
         task_count = len(blackboard.tasks)
-        # Cerebrum 轮次假设生成（平均 ~300 token/轮）
-        cerebrum_in = stats["hypotheses"] * 300 + max_rounds * 500
-        # Drone 任务（平均 ~500 token in / ~300 token out）
-        drone_in = task_count * 500
-        drone_out = task_count * 300
+        # Issue-21 修复：使用更精确的 token 估算（Drone 平均 ~800 token in / ~500 token out）
+        # 注：若需要更精确数据，可在 Cerebrum/Drone 的 prompt 调用处调用 finops_monitor.record_from_text()
+        cerebrum_in = hyp_count * 300 + max_rounds * 500
+        cerebrum_out = max_rounds * 300
+        drone_in = task_count * 800
+        drone_out = task_count * 500
 
         fm.record(role="cerebrum",
                   tokens_in=cerebrum_in,
-                  tokens_out=max_rounds * 300,
+                  tokens_out=cerebrum_out,
                   model="kimi-long-context",
                   latency_ms=0,
                   hypothesis_count=hyp_count)
@@ -732,8 +733,8 @@ async def run(target: str, work_dir: Path, root_dir: Path,
         # Session Pool 统计
         if session_pool is not None:
             fm.print_pool_stats(session_pool, console=console)
-    except Exception:
-        pass  # FinOps 失败不影响主流程
+    except Exception as e:
+        console.print(f"[dim][FinOps] 成本报告生成失败（非致命）: {e}[/dim]")
 
     # ── 导出报告文件 ──
     elapsed = _time.monotonic() - start_time
@@ -759,6 +760,15 @@ async def run(target: str, work_dir: Path, root_dir: Path,
             # 同时导出一份 JSON（机器可读）
             json_p = out_p.with_suffix(".json")
             export_report_json(report_data, json_p)
+
+        # ── 新增：导出利用链图（DOT + GraphML）──
+        if blackboard.hypotheses:
+            dot_path = out_p.with_suffix(".dot")
+            gml_path = out_p.with_suffix(".graphml")
+            if blackboard.export_exploit_chain_graph(dot_path):
+                console.print(f"[dim]   + Graph (DOT): {dot_path}[/]")
+            if blackboard.export_graphml(gml_path):
+                console.print(f"[dim]   + Graph (GraphML): {gml_path}[/]")
 
         console.print(f"\n[bold green]📄 Report exported:[/] {out_p}")
         if out_p.suffix.lower() != ".json":

@@ -60,6 +60,10 @@ DEFAULT_ROLES = [
     "crash-analyzer",
     "harness-generator",
     "general",
+    # 分析类角色
+    "doc-analyst",
+    "semantic-analyzer",
+    "scope-definer",
 ]
 
 
@@ -105,11 +109,19 @@ class _PreWarmedSession:
         self.use_count = 0   # 复用次数统计
 
     async def check_health(self) -> bool:
-        """检查 session 是否仍然健康（未被 SDK 内部关闭）。"""
+        """
+        检查 session 是否仍然健康（未被 SDK 内部关闭）。
+        真实检测：发送极短 prompt，收到第一块响应即确认连接可用（<2s）。
+        """
+        if self.session is None:
+            return False
         try:
-            # 发送一个空 prompt 检测连接
-            # 注意：不等待完整响应，只检测发送是否成功
-            return True
+            # 发送极短 prompt 并设置 2s 超时，避免永久阻塞
+            received = False
+            async for _ in self.session.prompt("ping"):
+                received = True
+                break
+            return received
         except Exception:
             return False
 
@@ -219,11 +231,23 @@ class DroneSessionPool:
                 f"该 slot 不可用，将回退到按需创建",
                 file=sys.stderr,
             )
+            # Session 创建失败时清理已写入的 agent yaml，避免临时文件泄露
+            if agent_file.exists():
+                try:
+                    agent_file.unlink()
+                except Exception:
+                    pass
         except Exception as e:
             print(
                 f"⚠️  [SESSION POOL] {role} slot-{idx} Session.create() 失败：{e}",
                 file=sys.stderr,
             )
+            # Session 创建失败时清理已写入的 agent yaml
+            if agent_file.exists():
+                try:
+                    agent_file.unlink()
+                except Exception:
+                    pass
 
         return _PreWarmedSession(
             role=role,

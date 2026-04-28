@@ -65,11 +65,33 @@ class LocalBackend(StorageBackend):
         work_dir.mkdir(parents=True, exist_ok=True)
 
     def save(self, node_id: str, snapshot: dict) -> None:
+        """同步写入完整快照（异步化留给调用方处理）。"""
         path = self.work_dir / ".blackboard.json"
-        # 仍然写入完整快照（保证可读性，但异步化）
-        asyncio.get_event_loop().run_in_executor(
-            None, self._write_snapshot_sync, snapshot
-        )
+        try:
+            path.write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def load(self, node_id: str) -> Optional[dict]:
+        path = self.work_dir / ".blackboard.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def emit_event(self, node_id: str, event_type: str, data: Any) -> None:
+        pass  # 本地模式无全局总线，no-op
+
+    def write_audit_notes(self, node_id: str, content: str) -> None:
+        try:
+            (self.work_dir / ".audit_notes.md").write_text(content, encoding="utf-8")
+        except OSError:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,9 +165,7 @@ class IncrementalLocalBackend(LocalBackend):
             except RuntimeError:
                 loop = None
             if loop is not None and loop.is_running():
-                asyncio.get_event_loop().run_in_executor(
-                    None, self._write_snapshot_sync, snapshot
-                )
+                loop.run_in_executor(None, self._write_snapshot_sync, snapshot)
             else:
                 self._write_snapshot_sync(snapshot)
 
@@ -166,11 +186,10 @@ class IncrementalLocalBackend(LocalBackend):
         except OSError:
             pass
 
-    @staticmethod
-    def _write_snapshot_sync(snapshot: dict) -> None:
-        """同步写入完整快照（由线程池调用）"""
+    def _write_snapshot_sync(self, snapshot: dict) -> None:
+        """同步写入完整快照（由线程池调用）。使用实例的 work_dir 避免路径错乱。"""
         import json as _json
-        path = Path("./.blackboard.json")
+        path = self.work_dir / ".blackboard.json"
         try:
             path.write_text(
                 _json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
@@ -264,16 +283,18 @@ class RedisBackend(StorageBackend):
                 })
             )
             pipe.execute()
-        except Exception:
-            pass
+        except Exception as e:
+            import sys
+            print(f"[RedisBackend] save() failed for node {node_id} — {type(e).__name__}: {e}", file=sys.stderr)
 
     def load(self, node_id: str) -> Optional[dict]:
         try:
             raw = self._r.get(self._snapshot_key())
             if raw:
                 return json.loads(raw)
-        except Exception:
-            pass
+        except Exception as e:
+            import sys
+            print(f"[RedisBackend] load() failed for node {node_id} — {type(e).__name__}: {e}", file=sys.stderr)
         return None
 
     def emit_event(self, node_id: str, event_type: str, data: Any) -> None:

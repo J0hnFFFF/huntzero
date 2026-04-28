@@ -5,6 +5,7 @@ Drone Worker — 用完即焚的原子执行节点。
 """
 import asyncio
 import re
+import sys
 import uuid
 import yaml
 from pathlib import Path
@@ -32,6 +33,9 @@ class Drone:
 
     # 类变量：全局 Session 池（由 Cerebrum 初始化时注入）
     _session_pool: Optional[Any] = None
+
+    # 非安全分析角色使用透传模式（定义在 class 级别，避免函数内重复构造）
+    _PASSTHROUGH_ROLES = frozenset({"scope-definer", "doc-analyst"})
 
     def __init__(
         self,
@@ -61,13 +65,20 @@ class Drone:
         self._sandbox   = sandbox_dir
 
         # 创建指向目标项目的软链接（只读访问）
+        if not self._ensure_target_link(sandbox_dir):
+            # Windows may require admin rights for symlinks. Fall back to direct access.
+            self.work_dir = work_dir
+
+    def _ensure_target_link(self, sandbox_dir: Path) -> bool:
+        """Expose the task target as ./_target inside an existing sandbox."""
         project_link = sandbox_dir / "_target"
-        if not project_link.exists():
-            try:
-                project_link.symlink_to(work_dir, target_is_directory=True)
-            except (OSError, NotImplementedError):
-                # Windows 可能需要管理员权限创建 symlink，回退到直接使用原目录
-                self.work_dir = work_dir
+        if project_link.exists():
+            return True
+        try:
+            project_link.symlink_to(self._original_work_dir, target_is_directory=True)
+            return True
+        except (OSError, NotImplementedError):
+            return False
 
     async def _build_session(self):
         from kimi_agent_sdk import Session
@@ -139,15 +150,15 @@ class Drone:
                 timeout=60.0,  # Session 创建超时 60s
             )
         except asyncio.TimeoutError:
-            _sys.stderr.write(f"[Drone {self.task_id}] ❌ Session.create() timed out after 60s (likely API auth/network issue)\n")
+            _sys.stderr.write(f"[Drone {self.task_id}] Session.create() timed out after 60s (likely API auth/network issue)\n")
             _sys.stderr.flush()
             raise RuntimeError(f"Session.create() timed out for drone {self.task_id} — check API key and network connectivity")
         except Exception as e:
-            _sys.stderr.write(f"[Drone {self.task_id}] ❌ Session.create() failed: {e}\n")
+            _sys.stderr.write(f"[Drone {self.task_id}] Session.create() failed: {e}\n")
             _sys.stderr.flush()
             raise
 
-        _sys.stderr.write(f"[Drone {self.task_id}] ✅ Session created successfully\n")
+        _sys.stderr.write(f"[Drone {self.task_id}] Session created successfully\n")
         _sys.stderr.flush()
         return session
 
@@ -171,97 +182,120 @@ class Drone:
         """
         运行任务并返回文本输出。
         支持多轮自驱追踪，通过结构化证据链管理上下文，防止 token 膨胀。
+
+        关键设计：
+          - 整个 chase rounds 循环必须在 `async with pool.acquire()` 范围内执行，
+            确保 session 在 Drone 使用期间不会被池提前回收（Bug-15 修复）。
+          - 只有 Drone 自己创建的 session 才在 finally 中关闭，
+            从池借用的 session 归还时只调用 pool.__aexit__（Bug-14 修复）。
         """
         from kimi_agent_sdk import TextPart, ThinkPart, ToolCall, ToolResult
-        import re as _re
         import time as _time
 
-        # ── Session 池快速路径 ────────────────────────────────────
-        # 优先从预热池借用 Session（<50ms），无可用时回退到按需创建
-        session = None
         pool = self._session_pool or getattr(Drone, "_session_pool", None)
-        if pool is not None:
-            try:
-                async with pool.acquire(self.drone_role) as pooled_session:
+        all_rounds: list[dict] = []
+        final_text = ""
+        _from_pool = False
+        pool_context = None
+        session = None
+
+        # ── Bug-15 修复：整个执行流程必须在 `async with pool.acquire()` 范围内 ──
+        # Bug-14 修复：_from_pool 标记决定 finally 是否调用 session.close()。
+        try:
+            if pool is not None:
+                try:
+                    pool_context = pool.acquire(self.drone_role)
+                    pooled_session = await pool_context.__aenter__()
                     if pooled_session is not None:
                         session = pooled_session
-                        # session 来自池，跳过 _build_session()
+                        _from_pool = True
+                        slot = getattr(pool_context, "_slot", None)
+                        sandbox_dir = getattr(slot, "sandbox_dir", None)
+                        if sandbox_dir is not None:
+                            self._ensure_target_link(Path(sandbox_dir))
                     else:
-                        # 池无可用 slot，按需创建（慢路径，~1000ms）
+                        await pool_context.__aexit__(None, None, None)
+                        pool_context = None
                         session = await self._build_session()
-            except Exception:
-                # 池出错，降级到原有行为
+                        _from_pool = False
+                except Exception:
+                    if pool_context is not None:
+                        try:
+                            await pool_context.__aexit__(*sys.exc_info())
+                        except Exception:
+                            pass
+                        pool_context = None
+                    session = await self._build_session()
+                    _from_pool = False
+            else:
                 session = await self._build_session()
-        else:
-            # 无池，按需创建（原有行为）
-            session = await self._build_session()
-        all_rounds: list[dict] = []  # 结构化的每轮摘要
-        final_text = ""
+                _from_pool = False
 
-        # 非安全分析角色（scope-definer, doc-analyst）使用透传模式：
-        # 直接发送原始任务描述，不包裹安全验证模板，避免输出格式冲突。
-        _PASSTHROUGH_ROLES = {"scope-definer", "doc-analyst"}
-
-        if self.drone_role in _PASSTHROUGH_ROLES:
-            initial_prompt = (
-                f"[DRONE TASK: {self.task_id}]\n"
-                f"Role: {self.drone_role}\n\n"
-                f"{self.task_desc}"
+            # ── 构建 prompt ────────────────────────────────────────────
+            target_hint = (
+                f"Target project root: {self._original_work_dir}\n"
+                "If ./_target exists in your working directory, use it as the read-only "
+                "project link.\n\n"
             )
-        else:
-            initial_prompt = (
-                f"[DRONE TASK: {self.task_id}]\n"
-                f"Role: {self.drone_role}\n\n"
-                f"Task:\n{self.task_desc}\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "IMPORTANT: Before reporting any finding, you MUST first answer these\n"
-                "screening questions based on your actual code investigation:\n\n"
-                "REACHABLE: Can an external/unauthenticated user reach this code path? [yes/no/unknown]\n"
-                "EXPLOITABLE: Can this be triggered with realistic, non-contrived input? [yes/no/unknown]\n"
-                "MITIGATED: Is there upstream validation or defense that prevents exploitation? [yes/no/unknown]\n\n"
-                "Only report a finding if REACHABLE != no AND EXPLOITABLE != no AND MITIGATED != yes.\n"
-                "If any screening question indicates the issue is not exploitable, report SEVERITY: none.\n\n"
-                "Return your analysis in this exact format:\n\n"
-                "REACHABLE: <yes/no/unknown — with brief justification>\n"
-                "EXPLOITABLE: <yes/no/unknown — with brief justification>\n"
-                "MITIGATED: <yes/no/unknown — with brief justification>\n"
-                "FINDING: <one-line summary of what you found>\n"
-                "SEVERITY: <critical|high|medium|low|none>\n"
-                "CONFIDENCE: <0.0-1.0>\n"
-                "EVIDENCE: <concrete code snippet, log line, or data proving the finding>\n"
-                "DETAIL: <full technical explanation>\n\n"
-                "If nothing significant: FINDING: No anomaly detected  SEVERITY: none\n\n"
-                "If you found something but need to trace further, end with:\n"
-                "TRACE_NEEDED: <specific question to answer in the next round>\n"
-                "TRACE_TARGET: <file path, function name, or code pattern to investigate>"
-            )
+            if self.drone_role in self._PASSTHROUGH_ROLES:
+                initial_prompt = (
+                    f"[DRONE TASK: {self.task_id}]\n"
+                    f"Role: {self.drone_role}\n\n"
+                    f"{target_hint}"
+                    f"{self.task_desc}"
+                )
+            else:
+                initial_prompt = (
+                    f"[DRONE TASK: {self.task_id}]\n"
+                    f"Role: {self.drone_role}\n\n"
+                    f"{target_hint}"
+                    f"Task:\n{self.task_desc}\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "IMPORTANT: Before reporting any finding, you MUST first answer these\n"
+                    "screening questions based on your actual code investigation:\n\n"
+                    "REACHABLE: Can an external/unauthenticated user reach this code path? [yes/no/unknown]\n"
+                    "EXPLOITABLE: Can this be triggered with realistic, non-contrived input? [yes/no/unknown]\n"
+                    "MITIGATED: Is there upstream validation or defense that prevents exploitation? [yes/no/unknown]\n\n"
+                    "Only report a finding if REACHABLE != no AND EXPLOITABLE != no AND MITIGATED != yes.\n"
+                    "If any screening question indicates the issue is not exploitable, report SEVERITY: none.\n\n"
+                    "Return your analysis in this exact format:\n\n"
+                    "REACHABLE: <yes/no/unknown — with brief justification>\n"
+                    "EXPLOITABLE: <yes/no/unknown — with brief justification>\n"
+                    "MITIGATED: <yes/no/unknown — with brief justification>\n"
+                    "FINDING: <one-line summary of what you found>\n"
+                    "SEVERITY: <critical|high|medium|low|none>\n"
+                    "CONFIDENCE: <0.0-1.0>\n"
+                    "EVIDENCE: <concrete code snippet, log line, or data proving the finding>\n"
+                    "DETAIL: <full technical explanation>\n\n"
+                    "If nothing significant: FINDING: No anomaly detected  SEVERITY: none\n\n"
+                    "If you found something but need to trace further, end with:\n"
+                    "TRACE_NEEDED: <specific question to answer in the next round>\n"
+                    "TRACE_TARGET: <file path, function name, or code pattern to investigate>"
+                )
 
-        # 时间预算：总预算 540s（外层 dispatcher 给 600s，留 60s 余量）
-        _TOTAL_BUDGET = 540.0
-        _MIN_ROUND_TIMEOUT = 60.0   # 单轮最低超时，低于此值不值得再跑
-        _t0 = _time.monotonic()
+            # 时间预算：总预算 1200s（原 540s 不够大型项目）
+            _TOTAL_BUDGET = 1200.0
+            _MIN_ROUND_TIMEOUT = 120.0  # 最低每轮 120 秒（原 60s）
+            _t0 = _time.monotonic()
 
-        try:
-            # 透传角色只需单轮执行，不进入多轮追踪
-            max_rounds = 1 if self.drone_role in _PASSTHROUGH_ROLES else self.MAX_CHASE_ROUNDS
+            max_rounds = 1 if self.drone_role in self._PASSTHROUGH_ROLES else self.MAX_CHASE_ROUNDS
+
             for chase_round in range(max_rounds):
                 if chase_round == 0:
                     prompt = initial_prompt
                 else:
                     prompt = self._build_chase_prompt(all_rounds, chase_round)
 
-                # 动态计算本轮超时：剩余预算平分给剩余轮次
                 elapsed = _time.monotonic() - _t0
                 remaining_budget = _TOTAL_BUDGET - elapsed
                 remaining_rounds = max_rounds - chase_round
                 round_timeout = max(remaining_budget / remaining_rounds, _MIN_ROUND_TIMEOUT)
 
-                # 预算耗尽则停止
                 if remaining_budget < _MIN_ROUND_TIMEOUT:
                     break
 
                 round_text = ""
-                _partial = {"text": ""}  # 可变容器：流式累积，超时时可回收
+                _partial = {"text": ""}
                 try:
                     async def fetch_prompt():
                         async for chunk in session.prompt(prompt):
@@ -271,21 +305,14 @@ class Drone:
 
                     round_text = await asyncio.wait_for(fetch_prompt(), timeout=round_timeout)
                 except asyncio.TimeoutError:
-                    # 关键修复：超时时保留已流式接收的部分结果，而非丢弃
                     round_text = _partial["text"]
                     self._error = "Drone execution timed out."
                     round_text += (
-                        f"\n[TIMEOUT] Drone timed out after 300s. "
-                        f"Partial results above ({len(_partial['text'])} chars) are preserved. "
-                        f"The task scope may be too broad for this codebase size — "
-                        f"consider narrowing to specific file paths and line ranges.\n"
+                        f"\n[TIMEOUT] Drone timed out after {round_timeout:.0f}s. "
+                        f"Partial results above ({len(_partial['text'])} chars) are preserved.\n"
                     )
-                    break  # 超时后不再继续追踪
+                    break
                 except Exception as e:
-                    # P1 FIX: 捕获 MaxStepsReached 和其他 SDK 异常。
-                    # kimi_agent_sdk 在 LLM 陷入工具调用死循环时会抛出
-                    # MaxStepsReached('Max number of steps reached: 100')。
-                    # 保留已流式接收的部分文本。
                     round_text = _partial.get("text", "") if _partial else ""
                     self._error = str(e)
                     err_type = type(e).__name__
@@ -297,18 +324,16 @@ class Drone:
                         )
                     else:
                         round_text += f"\n[SYSTEM ERROR] Drone execution caught an exception: {e}\n"
-                    break  # SDK 异常后不再继续追踪
+                    break
 
                 round_parsed = self._parse_round_output(round_text)
                 round_parsed["round"] = chase_round
                 round_parsed["raw_length"] = len(round_text)
                 all_rounds.append(round_parsed)
-                final_text = round_text  # 最后一轮的完整输出作为最终结果
+                final_text = round_text
 
-                # 每轮立刻抽取可能产生的 PoC（防止后续轮次将其舍弃）
                 self._extract_pocs_from_text(round_text, round_idx=chase_round)
 
-                # 多条件决策是否继续追踪
                 if chase_round < self.MAX_CHASE_ROUNDS - 1:
                     chase_decision = self._evaluate_chase_decision(all_rounds)
                     if chase_decision == "continue":
@@ -316,12 +341,19 @@ class Drone:
                     elif chase_decision == "stop":
                         break
                 else:
-                    break  # 达到上限
+                    break
+
         finally:
-            if 'session' in locals() and hasattr(session, 'close'):
+            if _from_pool and pool_context is not None:
+                try:
+                    await pool_context.__aexit__(*sys.exc_info())
+                except Exception:
+                    pass
+            # Bug-14 修复：只有非池 session 才手动关闭
+            if not _from_pool and session is not None and hasattr(session, "close"):
                 await session.close()
             self._cleanup()
-        # 如果有多轮，构建最终整合输出
+
         if len(all_rounds) > 1:
             final_text = self._synthesize_multi_round(all_rounds, final_text)
 
@@ -333,13 +365,11 @@ class Drone:
             return
             
         import re
-        # Find all markdown code blocks (handling spaces before lang)
         pattern = r'```([a-zA-Z0-9_+-]+)?[ \t]*\n(.*?)```'
         blocks = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
         
         if not blocks:
             return
-            
         
         dest_dir = self._original_work_dir / ("fuzz_jobs" if self.drone_role == "harness-generator" else "pocs")
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -352,11 +382,11 @@ class Drone:
                 "cpp": "cpp", "c": "c", "java": "java", "ruby": "rb",
                 "powershell": "ps1", "markdown": "md", "text": "txt"
             }
-            ext = ext_map.get(lang, lang)
+            # Bug-16 修复：ext 来自 LLM 输出，回退到白名单 "txt"，避免路径穿越
+            ext = ext_map.get(lang, "txt")
             if not ext:
                 ext = "txt"
                 
-            # Filter out tiny snippets (e.g. `ls -la`) unless it's shell
             if len(content.strip()) < 20 and ext not in ("sh", "ps1"):
                 continue
                 
@@ -365,7 +395,6 @@ class Drone:
             if self.drone_role == "harness-generator":
                 job_dir = dest_dir / safe_task_id
                 job_dir.mkdir(parents=True, exist_ok=True)
-                # Auto naming heuristics for fuzz harness
                 if ext in ("c", "cpp"):
                     file_name = "fuzz_harness.c" if ext == "c" else "fuzz_harness.cpp"
                 elif ext == "sh":
@@ -374,7 +403,6 @@ class Drone:
                     file_name = f"r{round_idx}_{i+1}.{ext}"
                 target_path = job_dir / file_name
             else:
-                # include round_idx to prevent overwriting
                 file_name = f"{safe_task_id}_r{round_idx}_poc_{i+1}.{ext}"
                 target_path = dest_dir / file_name
                 
@@ -418,39 +446,31 @@ class Drone:
 
         # 条件 1：Drone 明确请求了追踪方向
         if has_trace and severity not in ("none", ""):
-            # 但如果置信度在轮次间下降，说明追踪进入了死胡同
             if len(rounds) >= 2:
                 prev_conf = rounds[-2].get("confidence", 0.0)
                 if isinstance(prev_conf, (int, float)) and isinstance(confidence, (int, float)):
                     if confidence < prev_conf - 0.1:
-                        return "stop"  # 置信度显著下降，停止追踪
+                        return "stop"
             return "continue"
 
-        # 条件 2：有中高发现但置信度不够，且本轮没有明确说不需要追踪
+        # 条件 2：有中高发现但置信度不够
         if severity in ("critical", "high", "medium"):
             if isinstance(confidence, (int, float)) and confidence < 0.75:
-                # 检查是否没有明确说 TRACE_COMPLETE
                 raw_len = current.get("raw_length", 0)
-                if raw_len > 100:  # 有实质内容
+                if raw_len > 100:
                     return "continue"
 
         return "stop"
 
     def _build_chase_prompt(self, rounds: list[dict], chase_round: int) -> str:
-        """
-        构建追踪轮次的结构化提示词。
-        不是简单拼接旧文本，而是提取关键上下文构建精炼的追踪指令。
-        """
         prev = rounds[-1]
 
-        # 提取前轮核心信息（控制 token 量）
         finding_summary = prev.get("finding", "Unknown")[:300]
         evidence_summary = prev.get("evidence", "")[:2000]
         trace_question = prev.get("trace_needed", "")
         trace_target = prev.get("trace_target", "")
         prev_confidence = prev.get("confidence", 0.0)
 
-        # 证据链摘要（所有前轮的关键发现）
         chain_summary = ""
         if len(rounds) > 1:
             chain_lines = []
@@ -461,7 +481,6 @@ class Drone:
                 chain_lines.append(f"  Round {i}: [{sev}] conf={conf} — {finding[:150]}")
             chain_summary = f"\n## Evidence Chain So Far\n" + "\n".join(chain_lines) + "\n"
 
-        # 角色自适应追踪策略
         role_strategy = self._get_role_chase_strategy()
 
         return (
@@ -486,7 +505,6 @@ class Drone:
         )
 
     def _get_role_chase_strategy(self) -> str:
-        """根据 Drone 角色返回特化的追踪策略（Kimi 2.5 适配：目标驱动，不指定具体工具）。"""
         strategies = {
             "evidence-collector": (
                 "1. Verify: Read the exact source code at the evidence location\n"
@@ -540,18 +558,13 @@ class Drone:
 
     @staticmethod
     def _synthesize_multi_round(rounds: list[dict], last_raw: str) -> str:
-        """将多轮追踪的结果整合为单个结构化输出。"""
-        # 取最后一轮的结构化字段（最精炼的结论）
         final = rounds[-1]
-        # 合并所有轮次的证据
         all_evidence = []
         for i, r in enumerate(rounds):
             ev = r.get("evidence", "")
             if ev:
                 all_evidence.append(f"[Round {i}] {ev}")
 
-        # 如果最后一轮有完整的结构化输出，用它作为主体
-        # 但追加前几轮的证据作为补充
         if all_evidence and len(rounds) > 1:
             evidence_appendix = (
                 "\n\n--- Multi-round evidence chain ---\n" +
@@ -562,21 +575,15 @@ class Drone:
         return last_raw
 
     def _cleanup(self):
-        # 清理临时 agent yaml
         if self._agent_file and self._agent_file.exists():
             try:
                 self._agent_file.unlink()
             except Exception:
                 pass
 
-        # 将沙盒产出物持久化到工作区：
-        #   ./pocs/  → PoC 脚本、利用代码、exploit 文档
-        #   ./reports/ → 报告、证明文档、审计笔记
-        # 同时兼容旧行为：沙盒内显式 pocs/ 子目录也一并搬出。
         if hasattr(self, '_sandbox') and self._sandbox and self._sandbox.exists():
             import shutil as _shutil
 
-            # --- 1. 搬运沙盒根目录下的直接文件 ---
             _REPORT_EXTS  = {".md", ".txt", ".rst", ".html", ".pdf"}
             _SCRIPT_EXTS  = {".sh", ".py", ".js", ".ts", ".rb", ".pl", ".ps1"}
             _REPORT_NAMES = {"audit_notes", "logical_proof", "impact_assessment",
@@ -584,15 +591,12 @@ class Drone:
                              "readme", "summary", "findings", "report"}
             try:
                 for item in self._sandbox.iterdir():
-                    # 跳过 symlink (_target) 和子目录（由步骤 2 处理）
                     if item.name.startswith("_") or item.is_dir():
                         continue
                     ext = item.suffix.lower()
                     stem_lower = item.stem.lstrip(".").lower().replace("-", "_")
-                    # 报告类文档 → reports/
                     is_report = (ext in _REPORT_EXTS and
                                  any(kw in stem_lower for kw in _REPORT_NAMES))
-                    # 利用脚本 → pocs/（所有 .sh/.py/.js/.ts 及明确命名的 .md）
                     is_exploit = (ext in _SCRIPT_EXTS or
                                   any(kw in stem_lower for kw in
                                       {"exploit", "poc", "payload", "rce", "pwn"}))
@@ -601,7 +605,6 @@ class Drone:
                     elif is_exploit:
                         dest_dir = self._original_work_dir / "pocs"
                     else:
-                        # 其余未分类文件也保留到 pocs/ 避免丢失
                         dest_dir = self._original_work_dir / "pocs"
 
                     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -614,7 +617,6 @@ class Drone:
             except Exception:
                 pass
 
-            # --- 2. 搬运沙盒内显式 pocs/ 子目录（兼容旧约定）---
             try:
                 sandbox_pocs = self._sandbox / "pocs"
                 if sandbox_pocs.exists():
@@ -630,11 +632,3 @@ class Drone:
                                     pass
             except Exception:
                 pass
-
-        # NOTE: 不在这里删除沙盒目录。
-        # shutil.rmtree 会导致 [Errno 2]，因为 Kimi SDK 的后台异步操作
-        # 可能仍在引用 work_dir 下的路径。沙盒内容极小（仅一个 symlink），
-        # 留到进程结束后由 OS 或下次启动时统一清理。
-
-
-

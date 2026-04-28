@@ -10,6 +10,7 @@ Cerebrum — 主脑编排器（战略决策层）。
 不执行任何具体测试。只负责"想"和"调度"。
 """
 import asyncio
+import os
 import re
 import time
 import uuid
@@ -1237,6 +1238,169 @@ class Cerebrum:
 
     # ─── Round 0: 文档情报收集 ─────────────────────────────────────────────────
 
+    _DOC_INTEL_DEFAULT_TIMEOUT = 120.0
+    _DOC_INTEL_MAX_FILES = 48
+    _DOC_INTEL_MAX_FILE_BYTES = 200_000
+    _DOC_INTEL_MAX_SNAPSHOT_CHARS = 40_000
+
+    def _doc_intel_timeout(self) -> float:
+        """Bound Round 0 so documentation discovery cannot stall startup."""
+        raw = os.environ.get("KIMI_DOC_INTEL_TIMEOUT")
+        if not raw:
+            return self._DOC_INTEL_DEFAULT_TIMEOUT
+        try:
+            return max(15.0, float(raw))
+        except ValueError:
+            return self._DOC_INTEL_DEFAULT_TIMEOUT
+
+    def _is_doc_intel_candidate(self, rel_path: Path) -> tuple[bool, int]:
+        """Return whether a file belongs in the bounded Round 0 local snapshot."""
+        parts = [p.lower() for p in rel_path.parts]
+        name = rel_path.name.lower()
+        suffix = rel_path.suffix.lower()
+        depth = len(rel_path.parts)
+
+        doc_names = {
+            "readme", "readme.md", "readme.rst", "readme.txt",
+            "security.md", "security_policy.md", "security.txt",
+            "changelog.md", "changelog.txt", "history.md", "history.txt",
+            "releases.md", "release.md", "architecture.md", "design.md",
+            "api.md", "contributing.md", "license", "license.txt",
+        }
+        package_names = {
+            "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+            "composer.json", "composer.lock", "go.mod", "go.sum",
+            "requirements.txt", "pipfile", "pyproject.toml", "setup.py",
+            "cargo.toml", "cargo.lock", "pom.xml", "build.gradle",
+            "build.gradle.kts", "gemfile", "gemfile.lock",
+        }
+        config_names = {
+            "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+            ".env.example", ".env.template", "config.example.php",
+            "config.sample.php",
+        }
+        entry_names = {
+            "index.php", "login.php", "upload.php", "api.php", "main.php",
+            "main.py", "app.py", "index.js", "app.js", "main.go", "main.rs",
+            "__main__.py", "__init__.py",
+        }
+
+        if depth <= 3 and name in doc_names:
+            return True, 0
+        if name in package_names or name in config_names:
+            return True, 1
+        if parts and parts[0] in {"docs", "doc", ".github"} and suffix in {".md", ".txt", ".yml", ".yaml"}:
+            return True, 2
+        if depth <= 2 and name in entry_names:
+            return True, 3
+        if suffix == ".php" and depth <= 3 and name in {"common.inc.php", "config.php", "index.php"}:
+            return True, 4
+        return False, 99
+
+    def _build_local_doc_snapshot(self, target_path: Path) -> str:
+        """
+        Build a deterministic, bounded Round 0 snapshot before asking the LLM.
+        This keeps doc discovery cheap on source trees with sparse documentation.
+        """
+        if not target_path.is_dir():
+            return ""
+
+        skip_dirs = {
+            ".git", ".svn", "node_modules", "__pycache__", ".tox",
+            "build", "out", "dist", "target", "vendor", "third_party",
+            ".gradle", ".idea", ".vscode", ".next", ".nuxt",
+            "coverage", ".pytest_cache", ".mypy_cache",
+            "assets", "images", "image", "fonts", "uploads", "cache",
+            "reports", "pocs", "fuzz_jobs",
+        }
+
+        total_files = 0
+        total_size = 0
+        top_dirs: dict[str, int] = {}
+        candidates: list[tuple[int, str, Path, int]] = []
+
+        try:
+            for root, dirs, files in os.walk(str(target_path)):
+                dirs[:] = [
+                    d for d in dirs
+                    if d.lower() not in skip_dirs and (not d.startswith(".") or d == ".github")
+                ]
+                root_path = Path(root)
+                try:
+                    rel_root = root_path.relative_to(target_path)
+                except ValueError:
+                    rel_root = Path(".")
+
+                top_dir = "." if rel_root == Path(".") else rel_root.parts[0]
+                if top_dir != ".":
+                    top_dirs[top_dir] = top_dirs.get(top_dir, 0) + len(files)
+
+                for name in files:
+                    path = root_path / name
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+
+                    total_files += 1
+                    total_size += stat.st_size
+
+                    try:
+                        rel_path = path.relative_to(target_path)
+                    except ValueError:
+                        continue
+
+                    keep, priority = self._is_doc_intel_candidate(rel_path)
+                    if keep:
+                        candidates.append((priority, rel_path.as_posix(), path, stat.st_size))
+
+                if total_files > 10_000:
+                    break
+        except Exception as e:
+            return f"Local documentation pre-scan failed: {e}"
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        lines = [
+            f"## Local Pre-Scan Snapshot",
+            f"- Root: {target_path}",
+            f"- Files counted: {total_files}",
+            f"- Approx size: {total_size // 1_000_000} MB",
+        ]
+        if top_dirs:
+            top = sorted(top_dirs.items(), key=lambda item: item[1], reverse=True)[:12]
+            lines.append("- Top directories: " + ", ".join(f"{name}({count})" for name, count in top))
+        lines.append("")
+        lines.append("## Bounded File Extracts")
+
+        used = len("\n".join(lines))
+        added = 0
+        for _, rel, path, size in candidates[: self._DOC_INTEL_MAX_FILES]:
+            remaining = self._DOC_INTEL_MAX_SNAPSHOT_CHARS - used
+            if remaining <= 500:
+                lines.append("[SNAPSHOT TRUNCATED]")
+                break
+            try:
+                raw = path.read_bytes()[: self._DOC_INTEL_MAX_FILE_BYTES]
+                text = raw.decode("utf-8", errors="ignore")
+            except Exception as e:
+                text = f"[READ ERROR: {e}]"
+
+            max_for_file = min(4_000, max(500, remaining - 200))
+            truncated = len(text) > max_for_file or size > self._DOC_INTEL_MAX_FILE_BYTES
+            text = text[:max_for_file]
+            if truncated:
+                text += "\n[TRUNCATED]"
+
+            block = f"\n### {rel} ({size} bytes)\n{text}\n"
+            lines.append(block)
+            used += len(block)
+            added += 1
+
+        if added == 0:
+            lines.append("(No documentation, package, config, or entry-point files matched the pre-scan rules.)")
+
+        return "\n".join(lines)
+
     async def _run_doc_intelligence(self, target: str):
         """
         Round 0: 在主分析循环之前，派遣一个 doc-analyst Drone 扫描项目文档。
@@ -1248,27 +1412,51 @@ class Cerebrum:
             "text": "Round 0: Dispatching doc-analyst to scan project documentation before code analysis..."
         })
 
-        # 构建文档分析任务描述
+        local_snapshot = ""
+        if not target.startswith("http"):
+            local_snapshot = self._build_local_doc_snapshot(Path(target))
+            if local_snapshot:
+                await self._emit("cerebrum_thought", {
+                    "text": f"Round 0 local pre-scan prepared {len(local_snapshot)} chars; LLM will summarize bounded inputs."
+                })
+
+        doc_timeout = self._doc_intel_timeout()
+
+        # 构建文档分析任务描述（聚焦 md/代码/包管理文件，避免扫描大型二进制或无价值文件）
         doc_task_desc = (
-            f"Analyze all documentation in the project at: {target}\n\n"
-            "Scan the following files IN ORDER OF PRIORITY:\n\n"
-            "## Tier 1: High Security Value\n"
+            f"Analyze documentation and key files in the project at: {target}\n\n"
+            "A bounded local pre-scan has already collected likely documentation, package, "
+            "configuration, and entry-point files below. Use this snapshot as your primary "
+            "input. Do NOT recursively enumerate the full project in Round 0; only open a "
+            "listed file if a tiny confirmation is absolutely necessary.\n\n"
+            f"{local_snapshot or '(no local pre-scan snapshot available)'}\n\n"
+            "IMPORTANT: Only scan the following file types. SKIP everything else.\n\n"
+            "## Documentation Files (.md)\n"
             "- SECURITY.md / SECURITY_POLICY.md\n"
-            "- CHANGELOG.md / HISTORY.md / RELEASES.md (search for: fix, patch, CVE, security, vulnerability)\n"
-            "- .github/ISSUE_TEMPLATE/ (bug categories → historical failure modes)\n"
-            "- dependabot.yml / renovate.json (supply chain risk awareness)\n\n"
-            "## Tier 2: Architecture Understanding\n"
-            "- README.md (tech stack, core features, entry points)\n"
+            "- README.md / CHANGELOG.md / HISTORY.md / RELEASES.md\n"
             "- ARCHITECTURE.md / DESIGN.md / docs/architecture*\n"
-            "- CONTRIBUTING.md (code organization, test strategy)\n"
-            "- API.md / docs/api* / openapi.yaml / swagger.json (API endpoint enumeration)\n\n"
-            "## Tier 3: Configuration & Deployment\n"
-            "- Dockerfile / docker-compose.yml (exposed ports, volumes, privileges)\n"
-            "- *.example / *.sample / .env.example (default config values, key structures)\n"
-            "- Makefile / Taskfile.yml (build commands revealing internal tools)\n"
-            "- .github/workflows/ (CI security scan configs → known weaknesses)\n\n"
-            "## Tier 4: Dependencies\n"
-            "- package.json / go.mod / requirements.txt / Cargo.toml (dependency versions)\n\n"
+            "- CONTRIBUTING.md / API.md / docs/*.md\n"
+            "- Any *.md file in root or docs/ directories\n\n"
+            "## Package Management Files\n"
+            "- package.json / package-lock.json / yarn.lock / pnpm-lock.yaml\n"
+            "- go.mod / go.sum\n"
+            "- requirements.txt / requirements-*.txt / Pipfile / pyproject.toml / setup.py\n"
+            "- Cargo.toml / Cargo.lock\n"
+            "- pom.xml / build.gradle / build.gradle.kts\n"
+            "- composer.json / composer.lock\n"
+            "- Gemfile / Gemfile.lock\n\n"
+            "## Code Entry Points (for architecture understanding)\n"
+            "- src/main.* / src/index.* / src/app.*\n"
+            "- cmd/* / main.go / main.rs / main.py\n"
+            "- */__main__.py / */__init__.py (package entry points)\n\n"
+            "## Configuration Templates\n"
+            "- *.example / *.sample / .env.example / .env.template\n"
+            "- Dockerfile / docker-compose.yml / docker-compose.*.yml\n\n"
+            "## Security-Related\n"
+            "- .github/ISSUE_TEMPLATE/ / dependabot.yml / renovate.json\n"
+            "- .github/workflows/*.yml (for known vulnerability patterns)\n\n"
+            "## MAX FILE SIZE: 200KB per file\n"
+            "If a file is larger than 200KB, only read the first 200KB and note '[TRUNCATED]'.\n\n"
             "OUTPUT FORMAT:\n"
             "## 项目概况\n"
             "- 名称: [project name]\n"
@@ -1282,20 +1470,19 @@ class Cerebrum:
             "- 认证/授权: [declared mechanism — needs verification]\n"
             "- 数据流: [input → processing → storage]\n\n"
             "## 暴露面清单\n"
-            "- HTTP 端点: [key routes from docs/OpenAPI]\n"
+            "- HTTP 端点: [key routes]\n"
             "- 外部集成: [3rd party APIs, webhooks]\n"
-            "- 管理端/内部接口: [admin routes, diagnostic endpoints]\n\n"
-            "## 配置与部署\n"
-            "- 默认端口: [list]\n"
-            "- 默认凭据/密钥结构: [from .env.example]\n"
-            "- 容器权限: [privileged? root? capabilities?]\n\n"
+            "- 管理端/内部接口: [admin routes]\n\n"
+            "## 依赖清单\n"
+            "- [key dependencies with versions from package files]\n\n"
             "## 高价值假设种子\n"
             "Based on documentation intel, these directions merit priority investigation:\n"
             "1. [hypothesis — based on security history]\n"
             "2. [hypothesis — based on architecture attack surface]\n"
             "3. [hypothesis — based on config weakness]\n\n"
-            "IMPORTANT: Do NOT analyze code itself. Only read documentation files. "
-            "If a file does not exist, note '[NOT FOUND]' and move on."
+            "IMPORTANT: Do NOT analyze code itself. Only read documentation, package files, and config templates. "
+            "If a file does not exist, note '[NOT FOUND]' and move on. "
+            "SKIP any binary files, images, or non-text files."
         )
 
         try:
@@ -1310,9 +1497,9 @@ class Cerebrum:
 
             await self._emit("drone_launched", {"task_id": "R0-doc-intel", "role": "doc-analyst"})
 
-            # 文档分析用 300s 超时（每个文件读取都需要 API 往返）
-            result = await asyncio.wait_for(drone.execute(), timeout=600.0)
-            self._doc_intel = result or ""
+            # Bound doc analysis to 2 minutes by default; fall back to the local snapshot.
+            result = await asyncio.wait_for(drone.execute(), timeout=doc_timeout)
+            self._doc_intel = result or local_snapshot
 
             await self._emit("drone_completed", {"task_id": "R0-doc-intel"})
             await self._emit("cerebrum_thought", {
@@ -1320,13 +1507,13 @@ class Cerebrum:
             })
 
         except asyncio.TimeoutError:
-            self._doc_intel = ""
+            self._doc_intel = local_snapshot
             await self._emit("drone_timeout", {"task_id": "R0-doc-intel"})
             await self._emit("cerebrum_thought", {
-                "text": "Round 0 timed out — proceeding without document intelligence."
+                "text": f"Round 0 timed out after {doc_timeout:.0f}s — proceeding with local pre-scan intelligence."
             })
         except Exception as e:
-            self._doc_intel = ""
+            self._doc_intel = local_snapshot
             await self._emit("drone_failed", {
                 "task_id": "R0-doc-intel",
                 "error": f"Doc intelligence failed: {e}"
@@ -2033,9 +2220,9 @@ class Cerebrum:
             self._bg_tasks.add(dt)
             dt.add_done_callback(self._bg_tasks.discard)
 
-    _DRONE_TIMEOUT = 600          # 外层 Drone 执行超时（秒）
-    _DRONE_RETRY_TIMEOUT = 300    # 重试时缩短超时
-    _MAX_RETRIES = 1              # 超时最多重试次数
+    _DRONE_TIMEOUT = 900           # 外层 Drone 执行超时（秒）- 原 600s
+    _DRONE_RETRY_TIMEOUT = 600     # 重试时缩短超时 - 原 300s
+    _MAX_RETRIES = 2               # 超时最多重试次数 - 原 1，改为 2（大型项目需要更多重试）
 
     async def _run_drone_under_semaphore(self, semaphore, t_id: str, task):
         async with semaphore:
