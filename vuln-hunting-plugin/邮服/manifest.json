@@ -3,7 +3,9 @@
     "name": "Mail Server Vulnerability Hunting",
     "description": "专为邮件服务器（如 Exchange, Postfix, Zimbra）漏洞挖掘设计。包含协议 fuzz、逻辑漏洞分析等专职 sub-agents。",
     "version": "1.0.0",
-    "author": "john",
+    "author": "lieling.xyz",
+    "license": "MIT",
+    "repository": "https://github.com/lielingxyz/vuln-hunting-plugin",
     "agents": [
         {
             "path": ".agent/workflows/mail.md",

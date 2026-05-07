@@ -3,7 +3,9 @@
     "name": "Web Application Vulnerability Hunting",
     "description": "专为通用 Web 应用漏洞挖掘设计。覆盖 OWASP Top 10 及业务逻辑漏洞，支持自动化扫描与验证。",
     "version": "1.0.0",
-    "author": "john",
+    "author": "lieling.xyz",
+    "license": "MIT",
+    "repository": "https://github.com/lielingxyz/vuln-hunting-plugin",
     "agents": [
         {
             "path": ".agent/workflows/web.md",

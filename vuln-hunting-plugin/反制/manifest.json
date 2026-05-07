@@ -3,7 +3,9 @@
   "name": "Vulnerability Hunting Toolkit",
   "description": "一个高度自动化的漏洞挖掘插件套件，专为蜜罐反制场景设计。包含多个专职 sub-agents，支持一键全流程挖掘（理解 → 目标定义 → 并行挖掘 → 验证 → 利用链 → 评估 → 变体 → POC → 报告）。优先发现默认配置下可用于控制攻击者或信息获取的漏洞。",
   "version": "1.0.0",
-  "author": "john",
+  "author": "lieling.xyz",
+  "license": "MIT",
+  "repository": "https://github.com/lielingxyz/vuln-hunting-plugin",
   "agents": [
     {
       "path": "agents/orchestrator.md",
