@@ -390,7 +390,9 @@ class Drone:
             if len(content.strip()) < 20 and ext not in ("sh", "ps1"):
                 continue
                 
-            safe_task_id = self.task_id.replace(':', '_')
+            # 防御路径穿越：只保留字母数字、下划线和连字符
+            import re as _re
+            safe_task_id = _re.sub(r'[^a-zA-Z0-9_-]', '_', self.task_id)
             
             if self.drone_role == "harness-generator":
                 job_dir = dest_dir / safe_task_id

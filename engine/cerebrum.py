@@ -83,6 +83,7 @@ class SectorContext:
     max_drone_result_chars: int = 4000      # Drone 结果截断长度（增加以保留更多代码片段）
     max_hypotheses_in_prompt: int = 12      # prompt 中最多假设数
     max_tasks_in_prompt: int = 8            # prompt 中最多任务数
+    osv_context: str = ""                   # Coordinator 前置扫描的 OSV 依赖漏洞上下文
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -490,6 +491,7 @@ class Cerebrum:
         并生成 Cerebrum 可用的上下文摘要。
         完全可选：osv-scanner 缺失时静默跳过。
         """
+        _logger = logging.getLogger(__name__)
         try:
             from .osv_bridge import (
                 scan_dependencies,
@@ -511,14 +513,26 @@ class Cerebrum:
             })
             return
 
-        # 注入 Blackboard
+        # 注入 Blackboard — 批量写入，只 persist 一次，避免高频同步 I/O 阻塞事件循环
         findings_kwargs = osv_findings_to_blackboard(result)
-        for kwargs in findings_kwargs:
-            try:
-                await self.blackboard.add_finding(**kwargs)
-            except Exception as exc:
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Failed to inject OSV finding: {exc}")
+        if findings_kwargs:
+            import time as _time
+            import uuid as _uuid
+            from .blackboard import Finding
+            async with self.blackboard._lock:
+                for kwargs in findings_kwargs:
+                    try:
+                        f_id = f"F-{_uuid.uuid4().hex[:6].upper()}"
+                        finding = Finding(
+                            id=f_id,
+                            created_at=_time.time(),
+                            **{k: v for k, v in kwargs.items() if k in Finding.__dataclass_fields__},
+                        )
+                        self.blackboard.findings.append(finding)
+                    except Exception as exc:
+                        _logger.warning(f"Failed to inject OSV finding: {exc}")
+            self.blackboard._persist()
+            self.blackboard._write_audit_notes()
 
         # 生成 Cerebrum 上下文
         self._osv_context = build_cerebrum_context(result)
@@ -551,6 +565,8 @@ class Cerebrum:
             self._domain_terrain = self._load_domain_terrain(self._detected_domains)
             self._domain_pipeline = self._build_domain_pipeline(self._detected_domains)
             self._current_phase_idx = 0
+            # 继承 Coordinator 的 OSV 上下文，让 Sector LLM 知道已知脆弱依赖
+            self._osv_context = getattr(self.sector_context, "osv_context", "")
 
             print(f"  🔬 Sector Mini-Cerebrum: {sector.name} ({sector.path})")
 
@@ -611,6 +627,12 @@ class Cerebrum:
                 await self._launch_coordinated(target_path, sector_mgr)
                 return  # Coordinator 模式完成后直接返回
 
+        # ── Phase 0: 依赖漏洞前置扫描（OSV-Scanner）──
+        # 注意：必须在 _strategic_recon 之前扫描完整项目根目录，
+        # 否则 narrowed 后可能漏掉根目录的 lockfile/manifest。
+        if target_path and target_path.is_dir():
+            await self._inject_osv_findings(target_path)
+
         # ── 中小项目：原有 strategic_recon 逻辑 ──
         if target_path and target_path.is_dir():
             narrowed = await self._strategic_recon(target_path)
@@ -619,11 +641,6 @@ class Cerebrum:
                 target = str(narrowed)
                 self.blackboard.target = target
                 print(f"🎯 Strategic Focus: narrowed scope to {narrowed}")
-
-        # ── Phase 0: 依赖漏洞前置扫描（OSV-Scanner）──
-        scan_target = Path(self.blackboard.target) if not self.blackboard.target.startswith("http") else None
-        if scan_target and scan_target.is_dir():
-            await self._inject_osv_findings(scan_target)
 
         # ── Round 0: 文档情报收集（在主循环之前） ──
         await self._run_doc_intelligence(target)
@@ -1738,10 +1755,13 @@ class Cerebrum:
         await asyncio.sleep(min_wait)
 
         # 如果有活跃 Drone，等待至少一个完成
-        initial_done = len([
-            t for t in self.blackboard.snapshot()["tasks"].values()
-            if t["status"] in ("done", "failed")
-        ])
+        # FIX: 避免高频调用 snapshot()（全量序列化），直接遍历 tasks 字典
+        from .blackboard import TaskStatus as _TaskStatus
+        _done_status = {_TaskStatus.DONE, _TaskStatus.FAILED}
+        initial_done = sum(
+            1 for t in self.blackboard.tasks.values()
+            if t.status in _done_status
+        )
 
         waited = min_wait
         while True:
@@ -1758,11 +1778,11 @@ class Cerebrum:
                 _sys.stderr.flush()
                 break
 
-            # 检查是否有新的完成任务
-            current_done = len([
-                t for t in self.blackboard.snapshot()["tasks"].values()
-                if t["status"] in ("done", "failed")
-            ])
+            # 检查是否有新的完成任务（轻量检查，不序列化整个 blackboard）
+            current_done = sum(
+                1 for t in self.blackboard.tasks.values()
+                if t.status in _done_status
+            )
             if current_done > initial_done:
                 # 至少有一个新 Drone 结果回来了，可以继续
                 await asyncio.sleep(2.0)  # 多等 2 秒让更多结果回来
@@ -2282,6 +2302,8 @@ class Cerebrum:
             self._total_tasks += 1
 
             # Bug Fix: 将 Task 引用存入 _bg_tasks，防止被 GC 回收
+            # 防御性清理：移除已完成的旧任务引用，防止集合无限增长
+            self._bg_tasks = {t for t in self._bg_tasks if not t.done()}
             dt = asyncio.create_task(self._run_drone_under_semaphore(semaphore, t_id, task))
             self._bg_tasks.add(dt)
             dt.add_done_callback(self._bg_tasks.discard)
@@ -2898,6 +2920,7 @@ class Cerebrum:
         sector_ctx = SectorContext(
             sector=sector,
             partition=partition,
+            osv_context=self._osv_context,
         )
 
         # 根据 sector 优先级和文件数量动态调整预算

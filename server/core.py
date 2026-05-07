@@ -212,14 +212,22 @@ class KimiSecCore:
             return []
         result = []
         for f in self._blackboard.findings:
-            result.append({
+            item = {
                 "id":            f.id,
                 "title":         f.title,
                 "severity":      f.severity,
                 "description":   f.description[:500],
                 "evidence":      f.evidence[:300],
                 "hypothesis_id": f.hypothesis_id,
-            })
+            }
+            # 传递 OSV / 依赖漏洞字段（如果存在）
+            if getattr(f, "finding_type", "zero_day") == "dependency_vuln":
+                item["finding_type"] = "dependency_vuln"
+                item["cve_id"] = getattr(f, "cve_id", "")
+                item["package_name"] = getattr(f, "package_name", "")
+                item["package_version"] = getattr(f, "package_version", "")
+                item["fixed_version"] = getattr(f, "fixed_version", "")
+            result.append(item)
         return result
 
     # ─────────────────────────────────────────────────────────────────────────

@@ -65,15 +65,19 @@ class LocalBackend(StorageBackend):
         work_dir.mkdir(parents=True, exist_ok=True)
 
     def save(self, node_id: str, snapshot: dict) -> None:
-        """同步写入完整快照（异步化留给调用方处理）。"""
+        """原子写入完整快照：先写临时文件再重命名，避免写入中断导致数据损坏。"""
         path = self.work_dir / ".blackboard.json"
+        tmp_path = self.work_dir / ".blackboard.json.tmp"
         try:
-            path.write_text(
+            tmp_path.write_text(
                 json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
             )
-        except OSError:
-            pass
+            tmp_path.replace(path)
+        except OSError as exc:
+            # 静默丢弃但记录日志，避免磁盘满/权限问题时阻塞主流程
+            import logging
+            logging.getLogger(__name__).warning(f"Blackboard persist failed: {exc}")
 
     def load(self, node_id: str) -> Optional[dict]:
         path = self.work_dir / ".blackboard.json"
