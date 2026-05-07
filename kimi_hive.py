@@ -285,6 +285,10 @@ def print_final_report(blackboard: Blackboard):
 
     stats = blackboard.stats()
 
+    # 分类统计
+    zero_day_findings = [f for f in blackboard.findings if getattr(f, "finding_type", "zero_day") == "zero_day"]
+    dep_vuln_findings = [f for f in blackboard.findings if getattr(f, "finding_type", "zero_day") == "dependency_vuln"]
+
     # ── 统计摘要 ──
     summary = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
     summary.add_column(style="dim")
@@ -295,35 +299,73 @@ def print_final_report(blackboard: Blackboard):
     summary.add_row("Tasks executed",     str(stats["active_tasks"] +
                                               len([t for t in blackboard.tasks.values()
                                                    if t.status.value in ("done","failed","timeout")])))
-    summary.add_row("Findings",           f"[bold]{stats['findings']}[/]")
+    summary.add_row("Zero-Day Findings",  f"[bold]{len(zero_day_findings)}[/]")
+    if dep_vuln_findings:
+        summary.add_row("Dependency Vulns",   f"[bold blue]{len(dep_vuln_findings)}[/]")
     console.print(summary)
+
+    # ── Zero-Day 发现详情 ──
+    if zero_day_findings:
+        console.print()
+        console.print(Rule("[bold magenta] ZERO-DAY FINDINGS [/]", style="magenta"))
+        for i, f in enumerate(zero_day_findings, 1):
+            sev    = f.severity
+            style  = SEVERITY_STYLE.get(sev, "white")
+            icon   = SEVERITY_ICON.get(sev, "⚪")
+
+            panel_content = (
+                f"[dim]ID:[/] {f.id}\n"
+                f"[dim]Severity:[/] [{style}]{sev.upper()}[/]\n"
+                f"[dim]Hypothesis:[/] {f.hypothesis_id}\n\n"
+                f"[bold]Description:[/]\n{f.description[:600]}\n\n"
+                f"[bold]Evidence:[/]\n[dim]{f.evidence[:400]}[/]"
+            )
+
+            console.print(Panel(
+                panel_content,
+                title=f"[{style}]{icon} [{i}] {f.title[:80]}[/]",
+                border_style=style.split()[-1],
+                expand=False,
+            ))
+            console.print()
+
+    # ── 依赖漏洞详情 ──
+    if dep_vuln_findings:
+        console.print()
+        console.print(Rule("[bold blue] DEPENDENCY VULNERABILITIES (OSV) [/]", style="blue"))
+        for i, f in enumerate(dep_vuln_findings, 1):
+            sev    = f.severity
+            style  = SEVERITY_STYLE.get(sev, "white")
+            icon   = SEVERITY_ICON.get(sev, "⚪")
+            pkg    = getattr(f, "package_name", "") or ""
+            ver    = getattr(f, "package_version", "") or ""
+            fixed  = getattr(f, "fixed_version", "") or ""
+            cve    = getattr(f, "cve_id", "") or ""
+
+            meta_lines = f"[dim]Package:[/] {pkg}@{ver}"
+            if fixed:
+                meta_lines += f"  |  [dim]Fixed:[/] {fixed}"
+            if cve:
+                meta_lines += f"  |  [dim]CVE:[/] {cve}"
+
+            panel_content = (
+                f"{meta_lines}\n"
+                f"[dim]ID:[/] {f.id}\n"
+                f"[dim]Severity:[/] [{style}]{sev.upper()}[/]\n\n"
+                f"[bold]Description:[/]\n{f.description[:400]}\n\n"
+                f"[bold]Evidence:[/]\n[dim]{f.evidence[:300]}[/]"
+            )
+
+            console.print(Panel(
+                panel_content,
+                title=f"[{style}]{icon} [{i}] {f.title[:80]}[/]",
+                border_style=style.split()[-1],
+                expand=False,
+            ))
+            console.print()
 
     if not blackboard.findings:
         console.print("[dim italic]  No confirmed findings.[/]")
-        return
-
-    # ── 发现详情 ──
-    console.print()
-    for i, f in enumerate(blackboard.findings, 1):
-        sev    = f.severity
-        style  = SEVERITY_STYLE.get(sev, "white")
-        icon   = SEVERITY_ICON.get(sev, "⚪")
-
-        panel_content = (
-            f"[dim]ID:[/] {f.id}\n"
-            f"[dim]Severity:[/] [{style}]{sev.upper()}[/]\n"
-            f"[dim]Hypothesis:[/] {f.hypothesis_id}\n\n"
-            f"[bold]Description:[/]\n{f.description[:600]}\n\n"
-            f"[bold]Evidence:[/]\n[dim]{f.evidence[:400]}[/]"
-        )
-
-        console.print(Panel(
-            panel_content,
-            title=f"[{style}]{icon} [{i}] {f.title[:80]}[/]",
-            border_style=style.split()[-1],
-            expand=False,
-        ))
-        console.print()
 
     console.print(Rule(style="dim"))
 
@@ -381,9 +423,9 @@ async def _arbitration_worker(blackboard: Blackboard, auto_approve: bool = True)
 def _build_report_data(blackboard: Blackboard, target: str, elapsed: float) -> dict:
     """构建结构化报告数据（JSON-ready）。"""
     stats = blackboard.stats()
-    findings_list = []
-    for f in blackboard.findings:
-        findings_list.append({
+
+    def _finding_to_dict(f):
+        d = {
             "id": f.id,
             "hypothesis_id": f.hypothesis_id,
             "title": f.title,
@@ -391,7 +433,23 @@ def _build_report_data(blackboard: Blackboard, target: str, elapsed: float) -> d
             "description": f.description,
             "evidence": f.evidence,
             "created_at": f.created_at,
-        })
+            "finding_type": getattr(f, "finding_type", "zero_day"),
+        }
+        if getattr(f, "finding_type", "zero_day") == "dependency_vuln":
+            d["cve_id"] = getattr(f, "cve_id", "")
+            d["package_name"] = getattr(f, "package_name", "")
+            d["package_version"] = getattr(f, "package_version", "")
+            d["fixed_version"] = getattr(f, "fixed_version", "")
+        return d
+
+    zero_day_findings = [_finding_to_dict(f) for f in blackboard.findings
+                         if getattr(f, "finding_type", "zero_day") == "zero_day"]
+    dep_vuln_findings = [_finding_to_dict(f) for f in blackboard.findings
+                         if getattr(f, "finding_type", "zero_day") == "dependency_vuln"]
+
+    sev_key = lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(x["severity"], 4)
+    zero_day_findings.sort(key=sev_key)
+    dep_vuln_findings.sort(key=sev_key)
 
     hypotheses_list = []
     for h in blackboard.hypotheses.values():
@@ -405,6 +463,9 @@ def _build_report_data(blackboard: Blackboard, target: str, elapsed: float) -> d
             "evidence_count": len(h.evidence),
         })
 
+    # 保留 "findings" 键以兼容外部消费者（全部 finding 合并列表）
+    all_findings = zero_day_findings + dep_vuln_findings
+
     return {
         "engine": "HIVE-MIND INTEL ENGINE V8.0",
         "target": target,
@@ -414,11 +475,14 @@ def _build_report_data(blackboard: Blackboard, target: str, elapsed: float) -> d
             "total_hypotheses": stats["hypotheses"],
             "confirmed": stats["confirmed"],
             "discarded": stats["discarded"],
-            "total_findings": stats["findings"],
+            "total_findings": len(all_findings),
+            "zero_day_findings": len(zero_day_findings),
+            "dependency_vulns": len(dep_vuln_findings),
             "tasks_executed": len(blackboard.tasks),
         },
-        "findings": sorted(findings_list,
-                          key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(x["severity"], 4)),
+        "findings": all_findings,
+        "zero_day_findings": zero_day_findings,
+        "dependency_vulnerabilities": dep_vuln_findings,
         "hypotheses": hypotheses_list,
     }
 
@@ -455,17 +519,19 @@ def export_report_markdown(report_data: dict, output_path: Path):
         f"| Hypotheses | {s['total_hypotheses']} |",
         f"| Confirmed | {s['confirmed']} |",
         f"| Discarded | {s['discarded']} |",
-        f"| Findings | {s['total_findings']} |",
+        f"| Zero-Day Findings | {s.get('zero_day_findings', 0)} |",
+        f"| Dependency Vulns | {s.get('dependency_vulns', 0)} |",
         f"| Tasks Executed | {s['tasks_executed']} |",
         "",
     ])
 
-    findings = report_data.get("findings", [])
-    if findings:
-        lines.append("## Findings")
+    # ── Zero-Day Findings ──
+    zero_day = report_data.get("zero_day_findings", [])
+    if zero_day:
+        lines.append("## Zero-Day Findings")
         lines.append("")
         severity_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
-        for i, f in enumerate(findings, 1):
+        for i, f in enumerate(zero_day, 1):
             icon = severity_icon.get(f["severity"], "⚪")
             lines.extend([
                 f"### {icon} [{i}] {f['title']}",
@@ -486,7 +552,46 @@ def export_report_markdown(report_data: dict, output_path: Path):
                 f"",
             ])
     else:
-        lines.extend(["## Findings", "", "_No confirmed findings._", ""])
+        lines.extend(["## Zero-Day Findings", "", "_No zero-day findings._", ""])
+
+    # ── Dependency Vulnerabilities ──
+    dep_vulns = report_data.get("dependency_vulnerabilities", [])
+    if dep_vulns:
+        lines.append("## Dependency Vulnerabilities (OSV)")
+        lines.append("")
+        severity_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
+        for i, f in enumerate(dep_vulns, 1):
+            icon = severity_icon.get(f["severity"], "⚪")
+            meta = []
+            if f.get("package_name"):
+                meta.append(f"**Package**: `{f['package_name']}@{f.get('package_version', '')}`")
+            if f.get("fixed_version"):
+                meta.append(f"**Fixed in**: `{f['fixed_version']}`")
+            if f.get("cve_id"):
+                meta.append(f"**CVE**: {f['cve_id']}")
+            meta_line = " | ".join(meta)
+
+            lines.extend([
+                f"### {icon} [{i}] {f['title']}",
+                f"",
+                f"- **Severity**: {f['severity'].upper()}",
+                f"- **ID**: {f['id']}",
+            ])
+            if meta_line:
+                lines.append(f"- {meta_line}")
+            lines.extend([
+                f"",
+                f"**Description:**",
+                f"",
+                f"{f['description']}",
+                f"",
+                f"**Evidence:**",
+                f"",
+                f"```",
+                f"{f['evidence']}",
+                f"```",
+                f"",
+            ])
 
     lines.extend([
         "---",

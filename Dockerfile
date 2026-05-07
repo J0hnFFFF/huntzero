@@ -49,6 +49,16 @@ RUN if [ "$INSTALL_TREE_SITTER" = "true" ]; then \
 # Redis 异步库（Worker 模式需要）
 RUN pip install --no-cache-dir "redis[asyncio]>=5.0"
 
+# ─── 安装 OSV-Scanner ────────────────────────────────────────────────────────
+ARG OSV_VERSION="v2.0.0"
+ARG TARGETARCH
+RUN curl -fsSL -o /tmp/osv-scanner.tar.gz \
+      "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_${OSV_VERSION}_linux_${TARGETARCH}.tar.gz" \
+    && tar -xzf /tmp/osv-scanner.tar.gz -C /usr/local/bin --strip-components=1 \
+    && chmod +x /usr/local/bin/osv-scanner \
+    && rm -f /tmp/osv-scanner.tar.gz \
+    && osv-scanner --version
+
 # ─── Stage 3: 拷贝项目文件 ───────────────────────────────────────────────────
 COPY engine/        ./engine/
 COPY server/        ./server/

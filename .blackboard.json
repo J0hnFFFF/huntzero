@@ -1,0 +1,27 @@
+{
+  "target": "",
+  "active": false,
+  "hypotheses": {},
+  "tasks": {},
+  "findings": [
+    {
+      "id": "F-72FD74",
+      "hypothesis_id": "osv-test",
+      "title": "CVE-2024-1234: Test",
+      "description": "test desc",
+      "severity": "high",
+      "evidence": "ev",
+      "created_at": 1778126189.3427808,
+      "sector_id": null,
+      "poc_status": "pending",
+      "poc_output": null,
+      "poc_verified_at": null,
+      "prerequisites": null,
+      "finding_type": "dependency_vuln",
+      "cve_id": "CVE-2024-1234",
+      "package_name": "lodash",
+      "package_version": "4.17.20",
+      "fixed_version": "4.17.21"
+    }
+  ]
+}

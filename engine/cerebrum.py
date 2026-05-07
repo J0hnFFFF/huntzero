@@ -475,10 +475,61 @@ class Cerebrum:
         self._result_queue: asyncio.Queue = asyncio.Queue()
         self._active_drones: int          = 0
 
+        # OSV-Scanner 依赖审计上下文（前置扫描结果）
+        self._osv_context: str = ""
+
         # Bug Fix: telemetry 队列加上 maxsize，防止 OOM。
         pass
 
     # ─── 公共接口 ─────────────────────────────────────────────────────────────
+
+    async def _inject_osv_findings(self, target_path: Path) -> None:
+        """
+        Phase 0: 依赖漏洞前置扫描。
+        调用 OSV-Scanner 异步扫描目标目录，将结果预注入 Blackboard，
+        并生成 Cerebrum 可用的上下文摘要。
+        完全可选：osv-scanner 缺失时静默跳过。
+        """
+        try:
+            from .osv_bridge import (
+                scan_dependencies,
+                osv_findings_to_blackboard,
+                build_cerebrum_context,
+            )
+        except ImportError:
+            return
+
+        await self._emit("cerebrum_thought", {
+            "text": "🔍 Running dependency vulnerability audit (OSV-Scanner)..."
+        })
+
+        result = await scan_dependencies(target_path)
+
+        if result.errors and not result.vulnerabilities:
+            await self._emit("cerebrum_thought", {
+                "text": f"⚠️ OSV-Scanner error: {result.errors[0]}"
+            })
+            return
+
+        # 注入 Blackboard
+        findings_kwargs = osv_findings_to_blackboard(result)
+        for kwargs in findings_kwargs:
+            try:
+                await self.blackboard.add_finding(**kwargs)
+            except Exception as exc:
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to inject OSV finding: {exc}")
+
+        # 生成 Cerebrum 上下文
+        self._osv_context = build_cerebrum_context(result)
+
+        summary = (
+            f"📦 OSV-Scanner: {len(result.vulnerabilities)} vulnerabilities found "
+            f"({result.critical_count} critical, {result.high_count} high, "
+            f"{result.medium_count} medium, {result.low_count} low) "
+            f"in {len(result.scanned_files)} manifest(s)."
+        )
+        await self._emit("cerebrum_thought", {"text": summary})
 
     async def launch(self, target: str):
         """启动自主分析循环。阻塞直到分析完成或 stop() 被调用。"""
@@ -568,6 +619,11 @@ class Cerebrum:
                 target = str(narrowed)
                 self.blackboard.target = target
                 print(f"🎯 Strategic Focus: narrowed scope to {narrowed}")
+
+        # ── Phase 0: 依赖漏洞前置扫描（OSV-Scanner）──
+        scan_target = Path(self.blackboard.target) if not self.blackboard.target.startswith("http") else None
+        if scan_target and scan_target.is_dir():
+            await self._inject_osv_findings(scan_target)
 
         # ── Round 0: 文档情报收集（在主循环之前） ──
         await self._run_doc_intelligence(target)
@@ -2014,7 +2070,7 @@ class Cerebrum:
     # ─── Prompt 构建 ─────────────────────────────────────────────────────────
 
     def _build_phase_prompt(self) -> str:
-        """构建进入新阶段时的初始 prompt。注入文档情报 + 地形知识 + 阶段指令。"""
+        """构建进入新阶段时的初始 prompt。注入文档情报 + OSV上下文 + 地形知识 + 阶段指令。"""
         # Round 0 文档情报
         doc_section = ""
         if self._doc_intel:
@@ -2023,6 +2079,15 @@ class Cerebrum:
                 "The following intelligence was extracted from project documentation "
                 "BEFORE code analysis. Use it to generate higher-quality initial hypotheses.\n\n"
                 f"{self._doc_intel}\n\n"
+                "---\n\n"
+            )
+
+        # OSV 依赖漏洞上下文（前置扫描结果）
+        osv_section = ""
+        if self._osv_context:
+            osv_section = (
+                "\n## 🔒 Dependency Vulnerability Audit (OSV-Scanner)\n"
+                f"{self._osv_context}\n\n"
                 "---\n\n"
             )
 
@@ -2067,6 +2132,7 @@ class Cerebrum:
         return (
             f"{phase_header}"
             f"{doc_section}"
+            f"{osv_section}"
             f"{terrain_section}\n\n"
             f"{phase_instructions}"
             f"{phase_directive}"
@@ -2684,6 +2750,10 @@ class Cerebrum:
         await self._emit("coordinator_started", {
             "project": str(project_root),
         })
+
+        # ── Phase 0a: 依赖漏洞前置扫描（全项目一次）──
+        if project_root.is_dir():
+            await self._inject_osv_findings(project_root)
 
         # ── Phase 0: Decompose ──
         try:

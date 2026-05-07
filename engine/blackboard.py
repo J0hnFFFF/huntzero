@@ -149,6 +149,12 @@ class Finding:
     poc_verified_at: Optional[float] = None  # 验证时间戳
     # 利用前置条件（Exploit Prerequisites）
     prerequisites:  Optional["ExploitPrerequisites"] = None  # 利用所需的前置条件
+    # ── OSV / 依赖漏洞字段（可选）──────────────────────────────────────────
+    finding_type:   str = "zero_day"       # "zero_day" | "dependency_vuln"
+    cve_id:         str = ""               # e.g. CVE-2024-1234
+    package_name:   str = ""               # e.g. lodash
+    package_version: str = ""              # e.g. 4.17.20
+    fixed_version:  str = ""               # e.g. 4.17.21
 
 
 @dataclass
@@ -790,6 +796,7 @@ class Blackboard:
         severity: str,
         evidence: str,
         sector_id: Optional[str] = None,
+        **kwargs,
     ) -> str:
         async with self._lock:
             # FIX(Root Cause 4): Finding 级别去重 — 防止同一 Bug 被多次报告
@@ -820,6 +827,7 @@ class Blackboard:
                 evidence=evidence,
                 created_at=time.time(),
                 sector_id=sector_id,
+                **{k: v for k, v in kwargs.items() if k in Finding.__dataclass_fields__},
             )
             self.findings.append(finding)
             if hypothesis_id in self.hypotheses:
@@ -1296,6 +1304,7 @@ class BlackboardPartition:
         description: str,
         severity: str,
         evidence: str,
+        **kwargs,
     ) -> str:
         """
         添加 Finding：写入本分区缓存 + 自动 bubble up 到主 Blackboard。
@@ -1312,6 +1321,7 @@ class BlackboardPartition:
             severity=severity,
             evidence=evidence,
             sector_id=self.sector_id,
+            **kwargs,
         )
 
         # 本地缓存一份引用（方便 Sector 级别的 stats 统计）
