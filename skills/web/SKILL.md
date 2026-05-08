@@ -104,7 +104,7 @@ Web 应用接收的是**文本**（URL 字符串、JSON、Form Data），但最�
 | **Web 框架/库** | Express middleware, Django app | 漏洞需调用者传入恶意输入，严重性 **-1 级** |
 | **部署服务** | 生产环境 API 服务、管理后台 | 网络可达，**标准严重性** |
 | **API-Only 后端** | 纯 REST/GraphQL 无前端 | 关注认证/授权，XSS 相关性低 |
-| **自托管开源项目** | Ghost, WordPress, GitLab | 用户运维导致配置风险更高 |
+| **自托管开源项目** | 某已知漏洞, WordPress, GitLab | 用户运维导致配置风险更高 |
 
 **Web 框架中**的 SSRF 是 LOW（需要框架使用者自己暴露），
 **部署服务中**的 SSRF 是 HIGH（直接可利用）。

@@ -1,3 +1,8 @@
+---
+description: 供应链系统 Fuzz Harness 生成指南
+tags: [supply-chain, fuzz, libfuzzer, harness]
+---
+
 # 供应链系统 Fuzz Harness 生成指南
 
 ## 目标
