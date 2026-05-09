@@ -28,7 +28,7 @@ Token 估算：
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  成本常数

@@ -82,17 +82,17 @@ def _find_osv_scanner() -> Optional[str]:
     if env_path and Path(env_path).exists():
         return str(Path(env_path).resolve())
 
-    # 2. PATH 中查找
-    found = shutil.which("osv-scanner")
-    if found:
-        return found
-
-    # 3. 检查项目本地的 bin/ 目录（install_osv.py 默认安装位置）
+    # 2. 项目本地 bin/ 目录（install_osv.py 默认安装位置）——优先于 PATH，避免系统旧版冲突
     local_bin = Path(__file__).parent.parent / "bin" / "osv-scanner"
     if sys.platform == "win32":
         local_bin = local_bin.with_suffix(".exe")
     if local_bin.exists():
         return str(local_bin)
+
+    # 3. PATH 中查找（可能找到系统包管理器安装的旧版）
+    found = shutil.which("osv-scanner")
+    if found:
+        return found
 
     return None
 

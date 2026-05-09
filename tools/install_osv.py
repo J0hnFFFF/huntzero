@@ -5,7 +5,7 @@
 用法:
     python tools/install_osv.py
     # 或指定版本
-    python tools/install_osv.py --version v2.0.0
+    python tools/install_osv.py --version v2.3.8
 
 安装后可通过以下方式使用:
     export OSV_SCANNER_PATH=./bin/osv-scanner
@@ -14,6 +14,7 @@
 
 import argparse
 import platform
+import shutil
 import sys
 import urllib.request
 import zipfile
@@ -42,22 +43,51 @@ def detect_platform() -> tuple[str, str]:
     return os_name, arch
 
 
-def download_osv_scanner(version: str, dest_dir: Path) -> Path:
-    os_name, arch = detect_platform()
-    ext = "zip" if os_name == "windows" else "tar.gz"
-    asset_name = f"osv-scanner_{version}_{os_name}_{arch}.{ext}"
-    url = f"{RELEASE_BASE}/{version}/{asset_name}"
-
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = dest_dir / asset_name
-
-    print(f"Downloading {asset_name} ...")
-    print(f"URL: {url}")
-
+def _download(url: str, dest: Path) -> None:
+    """下载文件到指定路径。"""
+    print(f"Downloading from {url} ...")
     try:
-        urllib.request.urlretrieve(url, archive_path)
+        urllib.request.urlretrieve(url, dest)
     except Exception as exc:
         print(f"Download failed: {exc}", file=sys.stderr)
+        raise
+
+
+def download_osv_scanner(version: str, dest_dir: Path) -> Path:
+    os_name, arch = detect_platform()
+    binary_name = "osv-scanner.exe" if os_name == "windows" else "osv-scanner"
+    final_path = dest_dir / binary_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 策略 1: 新版格式（v2.3.0+）直接发布裸二进制 ──
+    # 资产名: osv-scanner_linux_amd64（无版本号前缀，无压缩后缀）
+    bare_asset = f"osv-scanner_{os_name}_{arch}"
+    if os_name == "windows":
+        bare_asset += ".exe"
+    bare_url = f"{RELEASE_BASE}/{version}/{bare_asset}"
+
+    try:
+        _download(bare_url, final_path)
+        if os_name != "windows":
+            final_path.chmod(0o755)
+        print(f"✅ Downloaded bare binary: {bare_asset}")
+        return final_path
+    except Exception:
+        print(f"   Bare binary not found, falling back to archive format...")
+
+    # ── 策略 2: 旧版格式（v2.0.x 及更早）tar.gz / zip 压缩包 ──
+    # 资产名: osv-scanner_v2.0.0_linux_amd64.tar.gz
+    ext = "zip" if os_name == "windows" else "tar.gz"
+    archive_asset = f"osv-scanner_{version}_{os_name}_{arch}.{ext}"
+    archive_url = f"{RELEASE_BASE}/{version}/{archive_asset}"
+    archive_path = dest_dir / archive_asset
+
+    try:
+        _download(archive_url, archive_path)
+    except Exception as exc:
+        print(f"Download failed for both formats: {exc}", file=sys.stderr)
+        print(f"   Tried: {bare_url}", file=sys.stderr)
+        print(f"   Tried: {archive_url}", file=sys.stderr)
         sys.exit(1)
 
     # 解压
@@ -72,32 +102,33 @@ def download_osv_scanner(version: str, dest_dir: Path) -> Path:
     archive_path.unlink()
 
     # 查找二进制
-    binary_name = "osv-scanner.exe" if os_name == "windows" else "osv-scanner"
     candidates = list(dest_dir.rglob(binary_name))
     if not candidates:
         print(f"Binary not found after extraction. Check {dest_dir}", file=sys.stderr)
         sys.exit(1)
 
     binary = candidates[0]
-    final_path = dest_dir / binary_name
     binary.rename(final_path)
 
-    # 清理残留目录（osv-scanner 压缩包通常包含一个子目录）
+    # 清理残留目录
     for item in dest_dir.iterdir():
         if item.is_dir():
-            import shutil
             shutil.rmtree(item)
 
-    # 设置可执行权限
     if os_name != "windows":
         final_path.chmod(0o755)
 
+    print(f"✅ Downloaded and extracted: {archive_asset}")
     return final_path
 
 
 def main():
     parser = argparse.ArgumentParser(description="Install OSV-Scanner for kimiSec")
-    parser.add_argument("--version", default="v2.0.0", help="OSV-Scanner release version")
+    parser.add_argument(
+        "--version",
+        default="v2.3.8",
+        help="OSV-Scanner release version (default: v2.3.8)",
+    )
     parser.add_argument(
         "--dest", default="bin", help="Destination directory (default: ./bin)"
     )
@@ -107,7 +138,7 @@ def main():
     dest_dir = root / args.dest
 
     binary = download_osv_scanner(args.version, dest_dir)
-    print(f"✅ OSV-Scanner installed: {binary}")
+    print(f"\n✅ OSV-Scanner installed: {binary}")
     print(f"   Set environment variable: export OSV_SCANNER_PATH={binary}")
 
 

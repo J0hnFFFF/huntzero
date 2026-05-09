@@ -10,6 +10,7 @@ Cerebrum — 主脑编排器（战略决策层）。
 不执行任何具体测试。只负责"想"和"调度"。
 """
 import asyncio
+import logging
 import os
 import re
 import time
@@ -223,6 +224,15 @@ The JSON object MUST conform to this exact schema:
       "description": "Concrete micro-task: what to search, what to measure, what to verify"
     }
   ],
+  "findings": [
+    {
+      "title": "One-line summary of the vulnerability",
+      "description": "Technical explanation with file paths and line numbers",
+      "severity": "critical|high|medium|low",
+      "confidence": 0.85,
+      "evidence": "Concrete code snippet proving the vulnerability"
+    }
+  ],
   "critique": "Self-assessment: Am I repeating? Missing regions? Confidence calibrated?",
   "is_complete": false,
   "complete_reason": null
@@ -234,6 +244,7 @@ The JSON object MUST conform to this exact schema:
 - **hypotheses**: Array of hypothesis objects. Each MUST have claim, target, falsification, confidence (0.0-1.0).
 - **tasks**: Array of task objects. Each MUST have hypothesis_ref (first ~30 chars of claim), role (see below), description.
 - **role** MUST be one of: topology-mapper, data-flow-tracer, state-validator, evidence-collector, verifier, scope-definer, semantic-analyzer, exploit-crafter
+- **findings** (OPTIONAL): Array of confirmed findings. ONLY populate this when you have DIRECT CODE EVIDENCE of a vulnerability. Do NOT include speculative findings here — use hypotheses for those. Each finding MUST include: title, description, severity, confidence (≥0.75), evidence (code snippet). When you add a finding here, you do NOT need to dispatch a Drone to verify it — the finding is recorded immediately.
 - **critique**: Your honest self-assessment. Can contain anything — it is NEVER parsed for control signals.
 - **is_complete**: Boolean. Set to `true` ONLY when ALL hypotheses are exhausted or confirmed AND you have no more productive actions.
 - **complete_reason**: String explaining why you're stopping, or `null` if not complete.
@@ -339,7 +350,7 @@ class TerminationGuard:
     max_rounds:        int   = 30      # 最多推理轮数
     max_tasks:         int   = 200     # 最多派发任务数
     max_wall_time:     float = 7200.0  # 最长运行时间（秒）
-    stagnation_rounds: int   = 3       # 连续 N 轮无新 Finding 即判定停滞
+    stagnation_rounds: int   = 5       # 连续 N 轮无新 Finding 即判定停滞
 
     # 内部状态
     _start_time:       float = field(default_factory=time.monotonic, init=False)
@@ -436,7 +447,7 @@ class Cerebrum:
         max_rounds:            int   = 30,
         max_tasks:             int   = 200,
         max_wall_time:         float = 7200.0,
-        stagnation_rounds:     int   = 3,
+        stagnation_rounds:     int   = 5,
         sector_context:        Optional[SectorContext] = None,
         telemetry_queue:       Optional[asyncio.Queue] = None,
     ):
@@ -730,12 +741,86 @@ class Cerebrum:
         while not self._result_queue.empty():
             await asyncio.sleep(0.5)
 
+    async def _auto_promote_high_confidence_hypotheses(self):
+        """P0 FIX: 每轮自动收割高置信度假设。
+
+        根因：Drone 验证链路可能因超时/失败而断裂，导致 Cerebrum 在思考中确认的
+        漏洞（如 manage.c 的 memcmp_constant_time 侧信道）永远停留在 ACTIVE 状态，
+        不会被转化为 Finding。
+
+        收割条件（满足任一即可）：
+        - confidence >= 0.80 且假设描述中包含具体代码位置（如 `file.c:123`）
+        - confidence >= 0.90（无论是否有代码位置）
+        - 假设已有 [confirmed] 标记但状态未更新为 CONFIRMED
+        """
+        import re as _re
+        existing_finding_hyp_ids = {f.hypothesis_id for f in self.blackboard.findings}
+        promoted = 0
+
+        for h_id, h in self.blackboard.hypotheses.items():
+            if h_id in existing_finding_hyp_ids:
+                continue
+            if h.status in (HypothesisStatus.CONFIRMED, HypothesisStatus.DISCARDED):
+                continue
+
+            has_code_ref = bool(_re.search(r'\b\w+\.(?:c|h|cpp|py|js|go|rs|java):\d+', h.description))
+            has_confirmed_tag = any(e.startswith("[confirmed]") for e in h.evidence)
+
+            should_promote = (
+                has_confirmed_tag
+                or (h.confidence >= 0.90)
+                or (h.confidence >= 0.80 and has_code_ref)
+            )
+
+            if not should_promote:
+                continue
+
+            severity = "medium"
+            desc_lower = h.description.lower()
+            if any(kw in desc_lower for kw in ("command injection", "rce", "remote code", "buffer overflow", "heap overflow", "stack overflow", "use-after-free", "uaf")):
+                severity = "high"
+            elif any(kw in desc_lower for kw in ("timing", "side-channel", "information leak", "info-leak", "denial of service", "dos", "crash")):
+                severity = "medium"
+            elif any(kw in desc_lower for kw in ("off-by-one", "signedness", "integer overflow", "truncation")):
+                severity = "low"
+
+            evidence_parts = [f"[auto-promoted] Confidence={h.confidence:.0%}: {h.description[:300]}"]
+            for ev in h.evidence:
+                if ev.startswith("[confirmed]") or ev.startswith("[critic-accepted]"):
+                    evidence_parts.append(ev)
+
+            # 从关联任务中提取更丰富的描述
+            task_details = []
+            for t_id in h.tasks:
+                task = self.blackboard.tasks.get(t_id)
+                if task and task.result and task.status == TaskStatus.DONE:
+                    raw = task.result if isinstance(task.result, str) else str(task.result)
+                    task_details.append(raw[:300])
+
+            description = h.description
+            if task_details:
+                description += "\n\n## Evidence from Drone Investigation\n" + "\n---\n".join(task_details[:3])
+
+            await self.blackboard.add_finding(
+                hypothesis_id=h_id,
+                title=h.description[:120],
+                description=description,
+                severity=severity,
+                evidence="\n".join(evidence_parts[:5]),
+            )
+            promoted += 1
+
+        if promoted > 0:
+            await self._emit("cerebrum_thought", {
+                "text": f"✅ Auto-promoted {promoted} high-confidence hypothesis(es) to Findings (confidence ≥ 0.80 + code evidence)"
+            })
+
     async def _sweep_orphaned_hypotheses(self):
         """P0 FIX: 假设 → Finding 最终收割机制。
 
         多层收割策略：
         Layer 1: 扫描 CONFIRMED/SUSPECTED 假设 (confidence >= 0.5)，有证据链 → 提升为 Finding
-        Layer 2: 扫描所有 ACTIVE/PENDING 假设 (confidence >= 0.85)  → 强制提升为 Finding
+        Layer 2: 扫描所有 ACTIVE/PENDING 假设 (confidence >= 0.75)  → 强制提升为 Finding
                  根因: 大模型 Critic 流程在 sector mode 下经常因 budget/timeout 被中断，
                  导致高置信假设永远停留在 ACTIVE 状态，不会被标记为 CONFIRMED。
         """
@@ -753,7 +838,7 @@ class Cerebrum:
                 h.status in (HypothesisStatus.CONFIRMED, HypothesisStatus.SUSPECTED)
                 and h.confidence >= 0.5
             )
-            is_layer2 = h.confidence >= 0.85
+            is_layer2 = h.confidence >= 0.75
 
             if not (is_layer1 or is_layer2):
                 continue
@@ -1921,6 +2006,54 @@ class Cerebrum:
                 else:
                     pass # 减少垃圾日志输出
 
+        # ── P0 FIX: 解析 LLM 直接报告的 findings（Cerebrum 发现 → 立即记录）──
+        findings_added = 0
+        for f in data.get("findings", []):
+            if not isinstance(f, dict):
+                continue
+            title = str(f.get("title", "")).strip()
+            desc = str(f.get("description", "")).strip()
+            severity = str(f.get("severity", "medium")).strip().lower()
+            evidence = str(f.get("evidence", "")).strip()
+            try:
+                f_conf = min(1.0, max(0.0, float(f.get("confidence", 0))))
+            except (ValueError, TypeError):
+                f_conf = 0.5
+            if not title or f_conf < 0.70:
+                continue
+            # 找到关联的假设（如果有）
+            hyp_id = None
+            for h_id, h in self.blackboard.hypotheses.items():
+                if title[:40].lower() in h.description.lower() or h.description[:40].lower() in title.lower():
+                    hyp_id = h_id
+                    break
+            if not hyp_id:
+                # 创建一个内部假设来承载这个 finding
+                hyp_id = await self.blackboard.add_hypothesis(
+                    description=f"[Cerebrum-direct] {title}: {desc[:200]}",
+                    confidence=f_conf,
+                )
+                await self._emit("hypothesis_generated", {
+                    "id": hyp_id, "claim": title[:80], "confidence": f_conf,
+                })
+            await self.blackboard.add_finding(
+                hypothesis_id=hyp_id,
+                title=title,
+                description=desc,
+                severity=severity if severity in ("critical", "high", "medium", "low") else "medium",
+                evidence=evidence or desc,
+            )
+            findings_added += 1
+            await self._emit("finding_confirmed", {
+                "task_id": "cerebrum-direct",
+                "severity": severity,
+                "title": title,
+            })
+        if findings_added > 0:
+            await self._emit("cerebrum_thought", {
+                "text": f"✅ Cerebrum directly reported {findings_added} finding(s) with code evidence"
+            })
+
         # ── GC: 限制最大活跃假说数，物理淘汰长尾尾部 ──
         from .blackboard import HypothesisStatus
         active_candidates = [
@@ -1931,6 +2064,9 @@ class Cerebrum:
             sorted_candidates = sorted(active_candidates, key=lambda x: x.confidence, reverse=True)
             for h in sorted_candidates[15:]:
                 await self.blackboard.update_hypothesis(h.id, status=HypothesisStatus.DISCARDED)
+
+        # ── P0 FIX: 每轮自动收割高置信度假设（防止 Drone 链路断裂导致漏报）──
+        await self._auto_promote_high_confidence_hypotheses()
 
         stats = self.blackboard.stats()
         print(f"  📊 Parser (JSON): {stats['hypotheses']} hypotheses | "
@@ -1943,6 +2079,7 @@ class Cerebrum:
             reason = "LLM declared analysis complete"
 
         # P0 修复：发现和证据停滞检测
+        # P1 FIX: 如果还有活跃 Drone 在执行，不算停滞（证据还在收集中）
         findings_count = len(self.blackboard.findings)
         evidence_count = sum(len(h.evidence) for h in self.blackboard.hypotheses.values())
         current_stag_state = (findings_count, evidence_count)
@@ -1951,7 +2088,10 @@ class Cerebrum:
             self._stagnation_state = current_stag_state
             self._stagnation_counter = 0
 
-        if self._stagnation_state == current_stag_state:
+        if self._active_drones > 0 or len(self.blackboard.get_active_tasks()) > 0:
+            # 还有工作在进行中，重置停滞计数器
+            self._stagnation_counter = 0
+        elif self._stagnation_state == current_stag_state:
             self._stagnation_counter += 1
         else:
             self._stagnation_state = current_stag_state
@@ -2220,6 +2360,19 @@ class Cerebrum:
                 f"  [Task {t['id']}] {t.get('description', '')[:100]}\n  Result:\n{raw_text}\n"
             )
 
+        # ── P1 FIX: 明确告知 Cerebrum 已派遣/已完成的任务，防止重复派遣 ──
+        dispatched_tasks = sorted(
+            [t for t in snap["tasks"].values() if t["status"] in ("queued", "running", "done", "failed", "timeout")],
+            key=lambda x: x.get("created_at", 0),
+            reverse=True,
+        )[:20]
+        dispatched_lines = []
+        for t in dispatched_tasks:
+            status_icon = {"queued": "⏳", "running": "🔵", "done": "✅", "failed": "❌", "timeout": "⏰"}.get(t["status"], "❓")
+            dispatched_lines.append(f"  {status_icon} [{t['id']}] {t.get('description', '')[:80]}")
+        if not dispatched_lines:
+            dispatched_lines.append("  (none yet)")
+
         budget_info = self._guard.budget_summary(self._round, self._total_tasks)
 
         # 当前阶段信息
@@ -2257,6 +2410,7 @@ class Cerebrum:
             f"### Hypothesis Tree\n" + ("\n".join(h_lines) or "  (empty)") + "\n\n"
             f"### Confirmed Findings\n" + ("\n".join(f_lines) or "  None yet.") + "\n\n"
             f"### Recent Drone Results\n" + ("\n".join(task_lines) or "  No results yet.") + "\n\n"
+            f"### Already Dispatched Tasks (DO NOT repeat these)\n" + "\n".join(dispatched_lines) + "\n\n"
             "## Cognitive Triggers (address in your 'thinking' field before generating hypotheses)\n"
             "1. ASSUMPTION AUDIT: Name one assumption about this system that you have NOT yet tested. Why haven't you? Is it because you believe it's safe — and if so, is that belief founded on evidence or habit?\n"
             "2. ANOMALY REFLECTION: In the Drone results above, is there anything SURPRISING — any behavior that contradicts your mental model of the system? Surprises are signposts to 0-days.\n"

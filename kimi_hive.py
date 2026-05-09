@@ -936,8 +936,8 @@ Examples:
     )
     parser.add_argument(
         "--stagnation", "-s",
-        type=int, default=3,
-        help="Stop after N consecutive rounds with no new hypotheses or findings (default: 3)",
+        type=int, default=5,
+        help="Stop after N consecutive rounds with no new hypotheses or findings (default: 5)",
     )
     parser.add_argument(
         "--auto-approve",
