@@ -211,7 +211,7 @@ The JSON object MUST conform to this exact schema:
   "thinking": "Your internal reasoning process. You can write ANYTHING here — plans, doubts, reflections, contingencies. This field is NEVER parsed for control signals.",
   "hypotheses": [
     {
-      "claim": "One precise testable sentence about a potential vulnerability",
+      "claim": "One precise testable sentence asserting the EXISTENCE of a potential vulnerability. The claim MUST be a positive statement about a security flaw, weakness, or exploitable condition — e.g. 'Function X in file.c has a buffer overflow when processing Y'. NEVER use negative claims like 'there is no vulnerability', 'this is secure', 'no exploitable issues found', or 'does not contain'.",
       "target": "Specific function/endpoint/module/file path",
       "falsification": "What observation would disprove this hypothesis",
       "confidence": 0.85
@@ -752,6 +752,10 @@ class Cerebrum:
         - confidence >= 0.80 且假设描述中包含具体代码位置（如 `file.c:123`）
         - confidence >= 0.90（无论是否有代码位置）
         - 假设已有 [confirmed] 标记但状态未更新为 CONFIRMED
+
+        注意：只有 polarity == "positive" 的假设（断言存在漏洞）才能被提升为 Finding。
+              polarity == "negative" 的假设（断言安全/无漏洞）在解析阶段已被过滤，
+              此处作为防御性校验保留。
         """
         import re as _re
         existing_finding_hyp_ids = {f.hypothesis_id for f in self.blackboard.findings}
@@ -761,6 +765,10 @@ class Cerebrum:
             if h_id in existing_finding_hyp_ids:
                 continue
             if h.status in (HypothesisStatus.CONFIRMED, HypothesisStatus.DISCARDED):
+                continue
+
+            # FIX: 防御性校验 — 只收割断言存在漏洞的假设
+            if getattr(h, "polarity", "positive") != "positive":
                 continue
 
             has_code_ref = bool(_re.search(r'\b\w+\.(?:c|h|cpp|py|js|go|rs|java):\d+', h.description))
@@ -823,6 +831,8 @@ class Cerebrum:
         Layer 2: 扫描所有 ACTIVE/PENDING 假设 (confidence >= 0.75)  → 强制提升为 Finding
                  根因: 大模型 Critic 流程在 sector mode 下经常因 budget/timeout 被中断，
                  导致高置信假设永远停留在 ACTIVE 状态，不会被标记为 CONFIRMED。
+
+        注意：只有 polarity == "positive" 的假设（断言存在漏洞）才能被提升为 Finding。
         """
         # 收集已有 Finding 的假设 ID
         existing_finding_hyp_ids = {f.hypothesis_id for f in self.blackboard.findings}
@@ -831,6 +841,10 @@ class Cerebrum:
         for h_id, h in self.blackboard.hypotheses.items():
             if h_id in existing_finding_hyp_ids:
                 continue  # 已有 Finding，跳过
+
+            # FIX: 防御性校验 — 只收割断言存在漏洞的假设
+            if getattr(h, "polarity", "positive") != "positive":
+                continue
 
             # Layer 1: CONFIRMED/SUSPECTED + confidence >= 0.5
             # Layer 2: ANY status + confidence >= 0.85 (高置信强制收割)
@@ -1972,6 +1986,15 @@ class Cerebrum:
                 conf = 0.5
             if not claim or conf <= 0.15 or claim[:40] in h_map:
                 continue
+            # FIX: Reject negative-polarity claims at the parser level.
+            # These are statements like "there is no vulnerability" which
+            # should never enter the hypothesis blackboard.
+            from .blackboard import classify_hypothesis_polarity
+            if classify_hypothesis_polarity(claim) == "negative":
+                await self._emit("cerebrum_thought", {
+                    "text": f"⚠️ Filtered negative-polarity hypothesis (not added to blackboard): {claim[:120]}"
+                })
+                continue
             h_id = await self.blackboard.add_hypothesis(claim, conf)
             h_map[claim[:40]] = h_id
             h_map[claim[:30]] = h_id
@@ -2033,6 +2056,12 @@ class Cerebrum:
                     description=f"[Cerebrum-direct] {title}: {desc[:200]}",
                     confidence=f_conf,
                 )
+                if not hyp_id:
+                    # FIX: 数据层拒绝了 negative-polarity 假设，跳过该 finding
+                    await self._emit("cerebrum_thought", {
+                        "text": f"⚠️ Filtered negative-polarity finding (no hypothesis created): {title[:120]}"
+                    })
+                    continue
                 await self._emit("hypothesis_generated", {
                     "id": hyp_id, "claim": title[:80], "confidence": f_conf,
                 })
@@ -2139,6 +2168,13 @@ class Cerebrum:
             body = m.group(3)
             claim = self._extract_first_text(body, CLAIM_TAGS)
             if not claim or conf <= 0.15 or claim[:40] in h_map: continue
+            # FIX: Reject negative-polarity claims at the parser level.
+            from .blackboard import classify_hypothesis_polarity
+            if classify_hypothesis_polarity(claim) == "negative":
+                await self._emit("cerebrum_thought", {
+                    "text": f"⚠️ Filtered negative-polarity hypothesis (XML parser): {claim[:120]}"
+                })
+                continue
             h_id = await self.blackboard.add_hypothesis(claim, conf)
             h_map[claim[:40]] = h_id
             await self._emit("hypothesis_generated", {"id": h_id, "claim": claim[:80], "confidence": conf})

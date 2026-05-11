@@ -96,6 +96,74 @@ class HypothesisStatus(str, Enum):
     DISCARDED = "discarded"  # 死胡同，已放弃
 
 
+def classify_hypothesis_polarity(description: str) -> str:
+    """
+    判断一个假设声明的极性。
+
+    - "positive": 声明存在漏洞/弱点/风险（这是安全扫描系统应该追踪的假设）
+    - "negative": 声明不存在漏洞、代码是安全的、没有可利用的弱点
+
+    基于语法模式检测而非简单关键词列表，识别以下否定结构：
+      [Subject] (has|have|is|are|contains|shows|exhibits) (no|not|never|none) [security_noun]
+      [Subject] (is|are) (secure|safe|not vulnerable|not exploitable)
+      (no|not|never) [security_noun] (in|within|found|detected|identified|present|exists)
+      [Subject] (does not|doesn't|cannot|can't) [exploit_verb]
+    """
+    import re as _re
+
+    lower = description.lower().strip()
+    if not lower:
+        return "positive"
+
+    # 安全相关名词和动词集合
+    security_nouns = (
+        r"vulnerability|vulnerabilities|exploit|exploits|flaw|flaws|"
+        r"bug|bugs|weakness|weaknesses|defect|defects|risk|risks|"
+        r"issue|issues|hole|holes|overflow|uaf|use.after.free|"
+        r"leak|leaks|bypass|bypasses|race.condition|toctou|"
+        r"injection|injections|sqli|xss|csrf|ssrf|"
+        r"memory.safety.problem|memory.safety.issue|buffer.error"
+    )
+    exploit_verbs = (
+        r"contain|contains|have|has|exhibit|exhibits|show|shows|"
+        r"present|presents|demonstrate|demonstrates|suffer|suffers"
+    )
+
+    # 模式1: Subject + (is/are/has/have/contains) + (no/not/never/none) + security_noun
+    p1 = _re.compile(
+        rf"\b\w+(?:\s+\w+){{0,6}}\s+"
+        rf"(?:is|are|has|have|contains|shows|exhibits)\s+"
+        rf"(?:no|not|never|none)\s+(?:\w+\s+){{0,3}}(?:{security_nouns})",
+        _re.IGNORECASE,
+    )
+
+    # 模式2: Subject + (is/are) + (secure/safe/not vulnerable/not exploitable)
+    p2 = _re.compile(
+        rf"\b\w+(?:\s+\w+){{0,6}}\s+"
+        rf"(?:is|are)\s+(?:secure|safe|not\s+vulnerable|not\s+exploitable|not\s+at\s+risk)",
+        _re.IGNORECASE,
+    )
+
+    # 模式3: (no/not/never) + security_noun + (in/within/found/detected/identified/present/exists)
+    p3 = _re.compile(
+        rf"\b(?:no|not|never)\s+(?:\w+\s+){{0,3}}(?:{security_nouns})"
+        rf"\s+(?:in|within|found|detected|identified|present|exists|observed)",
+        _re.IGNORECASE,
+    )
+
+    # 模式4: Subject + (does not / doesn't / cannot / can't) + exploit_verb
+    p4 = _re.compile(
+        rf"\b\w+(?:\s+\w+){{0,6}}\s+"
+        rf"(?:does\s+not|doesn't|cannot|can't)\s+(?:{exploit_verbs})",
+        _re.IGNORECASE,
+    )
+
+    if p1.search(lower) or p2.search(lower) or p3.search(lower) or p4.search(lower):
+        return "negative"
+
+    return "positive"
+
+
 class TaskStatus(str, Enum):
     QUEUED  = "queued"
     RUNNING = "running"
@@ -118,6 +186,8 @@ class HypothesisNode:
     evidence:    list[str] = field(default_factory=list)
     parent_id:   Optional[str] = None
     created_at:  float = 0.0
+    polarity:    str = "positive"     # "positive" = asserts existence of vuln
+                                      # "negative" = asserts absence of vuln / safety
 
 
 @dataclass
@@ -648,7 +718,11 @@ class Blackboard:
         description: str,
         confidence: float,
         parent_id: Optional[str] = None,
-    ) -> str:
+    ) -> Optional[str]:
+        # FIX: 数据层防御 — 拒绝否定性假设，确保 blackboard 的领域不变性
+        if classify_hypothesis_polarity(description) == "negative":
+            return None
+
         async with self._lock:
             # ── 布隆过滤器前置预筛（O(1)，零开销快速路径）──
             # 布隆过滤器说"肯定不存在" → 跳过五层扫描，直接新增
@@ -691,6 +765,7 @@ class Blackboard:
                     status=HypothesisStatus.PENDING,
                     parent_id=parent_id,
                     created_at=time.time(),
+                    polarity=classify_hypothesis_polarity(description),
                 )
                 self.hypotheses[h_id] = node
                 # 无论是否走五层扫描，新增假设都需要加入布隆过滤器
@@ -787,6 +862,63 @@ class Blackboard:
         self._persist()
 
     # ── 发现操作 ────────────────────────────────
+
+    async def request_finding_reverification(
+        self,
+        finding_id: str,
+        reason: str,
+    ) -> Optional[str]:
+        """
+        基于现有 Finding 重新拉起验证任务。
+
+        当外部验证（PoC 失败、人工复核质疑、Devil's Advocate 反驳）表明某个已确认的
+        Finding 可能不成立时，不直接删除 Finding，而是生成一个新的验证任务让 Drone
+        重新检查原始证据。
+
+        Args:
+            finding_id: 需要重新验证的 Finding ID
+            reason: 触发重验证的原因（如 "poc_failed", "devils_advocate_refuted",
+                    "manual_review_rejected"）
+        Returns:
+            新验证任务的 task_id，如果找不到 finding 或原 hypothesis 已被删除则返回 None
+        """
+        finding = None
+        for f in self.findings:
+            if f.id == finding_id:
+                finding = f
+                break
+        if not finding:
+            return None
+
+        hyp_id = finding.hypothesis_id
+        if hyp_id not in self.hypotheses:
+            return None
+
+        # 使用带时间戳和 reason 的描述，避免被 task deduplication 拦截
+        reverify_desc = (
+            f"[RE-VERIFICATION | {reason} | {time.time():.0f}] "
+            f"Re-check the validity of this previously confirmed finding.\n\n"
+            f"Original Finding: {finding.title}\n"
+            f"Original Severity: {finding.severity}\n"
+            f"Original Evidence:\n```\n{finding.evidence[:1500]}\n```\n\n"
+            f"Your task: Re-examine the exact code paths referenced in the evidence above. "
+            f"Determine whether the vulnerability is STILL present and exploitable, "
+            f"or whether it has been fixed, mitigated, or was a false positive. "
+            f"Report your conclusion with concrete code evidence."
+        )
+
+        # 为 hypothesis 附加重验证标记
+        existing = self.hypotheses[hyp_id]
+        tag = f"[re-verification-requested] {finding_id}: {reason}"
+        if len(existing.evidence) < 15 and tag not in existing.evidence:
+            existing.evidence.append(tag)
+
+        t_id = await self.add_task(
+            hypothesis_id=hyp_id,
+            description=reverify_desc,
+            drone_role="re-verifier",
+        )
+        return t_id
 
     async def add_finding(
         self,
@@ -1150,8 +1282,11 @@ class BlackboardPartition:
         description: str,
         confidence: float,
         parent_id: Optional[str] = None,
-    ) -> str:
+    ) -> Optional[str]:
         """在分区内添加假设（与 Blackboard.add_hypothesis 接口一致）。"""
+        if classify_hypothesis_polarity(description) == "negative":
+            return None
+
         async with self._lock:
             # 分区布隆过滤器前置预筛（O(1)，避免对分区假设池做全量扫描）
             if self._bloom.might_contain(description):
@@ -1181,6 +1316,7 @@ class BlackboardPartition:
                     status=HypothesisStatus.PENDING,
                     parent_id=parent_id,
                     created_at=time.time(),
+                    polarity=classify_hypothesis_polarity(description),
                 )
                 self.hypotheses[h_id] = node
                 self._bloom.add(description)
@@ -1296,6 +1432,63 @@ class BlackboardPartition:
         await self._broadcast("task_updated", {"id": t_id, **kwargs})
 
     # ── Finding 操作（写入本地 + 自动上报 parent）──────────
+
+    async def request_finding_reverification(
+        self,
+        finding_id: str,
+        reason: str,
+    ) -> Optional[str]:
+        """
+        基于现有 Finding 重新拉起验证任务。
+
+        当外部验证（PoC 失败、人工复核质疑、Devil's Advocate 反驳）表明某个已确认的
+        Finding 可能不成立时，不直接删除 Finding，而是生成一个新的验证任务让 Drone
+        重新检查原始证据。
+
+        Args:
+            finding_id: 需要重新验证的 Finding ID
+            reason: 触发重验证的原因（如 "poc_failed", "devils_advocate_refuted",
+                    "manual_review_rejected"）
+        Returns:
+            新验证任务的 task_id，如果找不到 finding 或原 hypothesis 已被删除则返回 None
+        """
+        finding = None
+        for f in self.findings:
+            if f.id == finding_id:
+                finding = f
+                break
+        if not finding:
+            return None
+
+        hyp_id = finding.hypothesis_id
+        if hyp_id not in self.hypotheses:
+            return None
+
+        # 使用带时间戳和 reason 的描述，避免被 task deduplication 拦截
+        reverify_desc = (
+            f"[RE-VERIFICATION | {reason} | {time.time():.0f}] "
+            f"Re-check the validity of this previously confirmed finding.\n\n"
+            f"Original Finding: {finding.title}\n"
+            f"Original Severity: {finding.severity}\n"
+            f"Original Evidence:\n```\n{finding.evidence[:1500]}\n```\n\n"
+            f"Your task: Re-examine the exact code paths referenced in the evidence above. "
+            f"Determine whether the vulnerability is STILL present and exploitable, "
+            f"or whether it has been fixed, mitigated, or was a false positive. "
+            f"Report your conclusion with concrete code evidence."
+        )
+
+        # 为 hypothesis 附加重验证标记
+        existing = self.hypotheses[hyp_id]
+        tag = f"[re-verification-requested] {finding_id}: {reason}"
+        if len(existing.evidence) < 15 and tag not in existing.evidence:
+            existing.evidence.append(tag)
+
+        t_id = await self.add_task(
+            hypothesis_id=hyp_id,
+            description=reverify_desc,
+            drone_role="re-verifier",
+        )
+        return t_id
 
     async def add_finding(
         self,
