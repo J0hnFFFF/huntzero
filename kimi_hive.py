@@ -40,13 +40,15 @@ except ImportError:
     print("\u274c Missing dep: pip install rich")
     sys.exit(1)
 
+# Import compat helpers early so the CPython 3.12.0 frozen+slots dataclass
+# workaround is active before kimi_agent_sdk / kimi_cli are loaded.
+from kimi_sdk_compat import patch_kimi_agent_sdk
+
 try:
     from kimi_agent_sdk import Config
 except ImportError:
     print("❌ Missing dep: pip install kimi-agent-sdk")
     sys.exit(1)
-
-from kimi_sdk_compat import patch_kimi_agent_sdk
 
 patch_kimi_agent_sdk()
 
@@ -605,8 +607,41 @@ def export_report_markdown(report_data: dict, output_path: Path):
 #  Git clone 工具
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _sanitize_repo_name(url: str) -> Optional[str]:
+    """
+    从 URL 提取并净化仓库名称，阻止路径遍历。
+
+    Security:
+    - URL 解码后验证名称
+    - 拒绝包含 '..' 或路径分隔符的名称
+    - 只允许安全字符（字母、数字、下划线、连字符、点号）
+    - 必须以字母或数字开头
+    """
+    import urllib.parse
+
+    # 提取最后一段作为仓库名
+    raw_name = url.rstrip("/").split("/")[-1]
+    # URL 解码
+    repo_name = urllib.parse.unquote(raw_name)
+    # 移除 .git 后缀
+    repo_name = repo_name.replace(".git", "")
+    # 移除所有非安全字符
+    repo_name = re.sub(r'[^a-zA-Z0-9._-]', '', repo_name)
+    # 显式阻止 '..' 和 '.' 危险模式
+    if '..' in repo_name or repo_name == '.' or repo_name.startswith('.'):
+        return None
+    # 必须以字母或数字开头
+    if not repo_name or not repo_name[0].isalnum():
+        return None
+    return repo_name
+
+
 async def prepare_git_target(url: str, work_dir: Path) -> Optional[Path]:
-    repo_name   = url.rstrip("/").split("/")[-1].replace(".git", "")
+    repo_name = _sanitize_repo_name(url)
+    if repo_name is None:
+        console.print("[bold red]❌ Invalid repository name in URL[/]")
+        return None
+
     projects    = work_dir / "projects"
     projects.mkdir(parents=True, exist_ok=True)
     target_dir  = projects / repo_name

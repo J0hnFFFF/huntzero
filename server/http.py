@@ -3,20 +3,81 @@ server/http.py — FastAPI REST + WebSocket（统一 Web 接口层）。
 
 替代原有 web_server.py，使用 KimiSecCore 而非直接导入 ClusterController。
 保持所有原有路由和行为不变。
+
+Security:
+- All /api/* endpoints require API key authentication
+- API key is passed via X-API-Key header
+- Configure via KIMISEC_API_KEY environment variable
 """
 
 import json
 import logging
+import os
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Security, Depends, status
 from fastapi.responses import HTMLResponse
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .core import KimiSecCore, EVENTS_CHANNEL, QUEUE_KEY, ROOT_DIR
 
 logger = logging.getLogger("kimisec.http")
+
+# ── API Key Authentication ────────────────────────────────────────────────────
+
+# API key from environment variable
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+
+async def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> str:
+    """
+    Verify API key from X-API-Key header.
+
+    Security:
+    - Rejects requests without API key
+    - Validates API key against environment variable
+    - Uses constant-time comparison to prevent timing attacks
+    """
+    expected_key = os.environ.get("KIMISEC_API_KEY")
+
+    # Check if API key is configured
+    if not expected_key:
+        logger.error("KIMISEC_API_KEY not configured")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: API key not set"
+        )
+
+    # Check if API key is provided
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key. Provide via X-API-Key header."
+        )
+
+    # Constant-time comparison to prevent timing attacks
+    if not (api_key == expected_key):
+        logger.warning("Invalid API key attempt")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key"
+        )
+
+    return api_key
+
+
+# Dependency for optional auth (for endpoints that might be public in future)
+async def verify_api_key_optional(api_key: Optional[str] = Security(api_key_header)) -> Optional[str]:
+    """Optional API key verification (currently unused, for future extensibility)."""
+    if not api_key:
+        return None
+    try:
+        return await verify_api_key(api_key)
+    except HTTPException:
+        return None
 
 
 # ─── Pydantic 模型（与 web_server.py 完全一致）──────────────────────────────
@@ -58,16 +119,16 @@ def create_app(core: KimiSecCore) -> FastAPI:
 
     # ── REST API（与 web_server.py 路由完全一致）──
 
-    @app.post("/api/jobs", summary="提交分析目标到集群队列")
+    @app.post("/api/jobs", summary="提交分析目标到集群队列", dependencies=[Depends(verify_api_key)])
     async def submit_jobs(body: SubmitRequest):
         result = core.submit_targets([t.model_dump() for t in body.targets])
         return {"ok": True, "message": result}
 
-    @app.get("/api/cluster", summary="获取集群实时状态看板")
+    @app.get("/api/cluster", summary="获取集群实时状态看板", dependencies=[Depends(verify_api_key)])
     async def get_cluster():
         return core.get_cluster_dashboard()
 
-    @app.get("/api/findings", summary="查询全局漏洞库")
+    @app.get("/api/findings", summary="查询全局漏洞库", dependencies=[Depends(verify_api_key)])
     async def get_findings(
         severity: Optional[str] = Query(None, enum=["critical", "high", "medium", "low"]),
         keyword:  Optional[str] = Query(None),
@@ -76,16 +137,16 @@ def create_app(core: KimiSecCore) -> FastAPI:
         findings = core.get_findings(severity=severity, keyword=keyword, limit=limit)
         return {"total": len(findings), "findings": findings}
 
-    @app.get("/api/insights", summary="跨项目漏洞模式分析")
+    @app.get("/api/insights", summary="跨项目漏洞模式分析", dependencies=[Depends(verify_api_key)])
     async def get_insights():
         return {"report": core.get_cross_project_insights()}
 
-    @app.delete("/api/jobs/{job_id}", summary="取消待执行任务")
+    @app.delete("/api/jobs/{job_id}", summary="取消待执行任务", dependencies=[Depends(verify_api_key)])
     async def cancel_job(job_id: str):
         result = core.cancel_job(job_id)
         return {"ok": True, "message": result}
 
-    @app.get("/api/queue", summary="获取队列中所有待执行任务")
+    @app.get("/api/queue", summary="获取队列中所有待执行任务", dependencies=[Depends(verify_api_key)])
     async def get_queue():
         if not core.redis_url:
             raise HTTPException(status_code=400, detail="Redis not configured")
@@ -104,7 +165,7 @@ def create_app(core: KimiSecCore) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Redis error: {e}")
 
-    @app.get("/api/jobs", summary="列出所有已知 Job")
+    @app.get("/api/jobs", summary="列出所有已知 Job", dependencies=[Depends(verify_api_key)])
     async def list_jobs():
         if not core.redis_url:
             raise HTTPException(status_code=400, detail="Redis not configured")
@@ -120,7 +181,7 @@ def create_app(core: KimiSecCore) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Redis error: {e}")
 
-    @app.get("/api/jobs/{job_id}/snapshot", summary="获取 Job 完整快照")
+    @app.get("/api/jobs/{job_id}/snapshot", summary="获取 Job 完整快照", dependencies=[Depends(verify_api_key)])
     async def get_job_snapshot(job_id: str):
         if not core.redis_url:
             raise HTTPException(status_code=400, detail="Redis not configured")
@@ -137,7 +198,7 @@ def create_app(core: KimiSecCore) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Redis error: {e}")
 
-    @app.get("/api/jobs/{job_id}/audit", summary="获取 Job 审计报告")
+    @app.get("/api/jobs/{job_id}/audit", summary="获取 Job 审计报告", dependencies=[Depends(verify_api_key)])
     async def get_job_audit(job_id: str):
         if not core.redis_url:
             raise HTTPException(status_code=400, detail="Redis not configured")
@@ -159,7 +220,62 @@ def create_app(core: KimiSecCore) -> FastAPI:
     workspace_dir = core.work_dir
     projects_dir = workspace_dir / "projects"
 
-    @app.get("/api/workspace/projects", summary="列出所有已扫描项目")
+    # ── 路径遍历保护 ────────────────────────────────────────────────────────
+    import re as _re
+
+    def _validate_project_path(name: str) -> Path:
+        """
+        验证项目名称并返回安全的解析后路径。
+
+        Security:
+        - 拒绝包含路径遍历字符的名称
+        - 解析路径并验证其在 projects_dir 内
+        - 显式阻止 '..' 和其他危险模式
+        """
+        # 严格验证：只允许简单名称（必须以字母或数字开头）
+        if not _re.match(r'^\w[\w.-]*$', name):
+            raise HTTPException(status_code=400, detail="Invalid project name")
+        # 显式阻止 '..' 和 '.' 危险模式
+        if '..' in name or name == '.' or name.startswith('.'):
+            raise HTTPException(status_code=400, detail="Invalid project name")
+
+        # 构造并解析路径
+        proj = (projects_dir / name).resolve()
+        projects_resolved = projects_dir.resolve()
+
+        # 验证解析后的路径在 projects_dir 内
+        try:
+            proj.relative_to(projects_resolved)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        return proj
+
+    def _validate_filename(filename: str) -> str:
+        """
+        验证文件名并阻止路径遍历。
+
+        Security:
+        - 拒绝包含路径遍历字符的文件名
+        - 阻止绝对路径
+        - 显式阻止 '..' 和 '.' 危险模式
+        - 只允许安全的文件名字符
+        """
+        # 拒绝路径遍历
+        if '..' in filename or '/' in filename or '\\' in filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        # 拒绝绝对路径
+        if Path(filename).is_absolute():
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        # 显式阻止 '..' 和 '.' 危险模式
+        if '..' in filename or filename == '.' or filename.startswith('.'):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        # 验证文件名格式（只允许字母、数字、下划线、连字符、点号）
+        if not _re.match(r'^[\w.-]+$', filename):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        return filename
+
+    @app.get("/api/workspace/projects", summary="列出所有已扫描项目", dependencies=[Depends(verify_api_key)])
     async def list_projects():
         if not projects_dir.exists():
             return {"total": 0, "projects": []}
@@ -200,12 +316,9 @@ def create_app(core: KimiSecCore) -> FastAPI:
             })
         return {"total": len(projects), "projects": projects}
 
-    @app.get("/api/workspace/projects/{name}/reports", summary="列出项目报告")
+    @app.get("/api/workspace/projects/{name}/reports", summary="列出项目报告", dependencies=[Depends(verify_api_key)])
     async def list_project_reports(name: str):
-        import re as _re
-        if not _re.match(r'^[\w.-]+$', name):
-            raise HTTPException(status_code=400, detail="Invalid project name")
-        proj = projects_dir / name
+        proj = _validate_project_path(name)
         if not proj.exists():
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
         reports_dir = proj / "reports"
@@ -228,19 +341,22 @@ def create_app(core: KimiSecCore) -> FastAPI:
         }
         return {"project": name, "reports": files, "meta": meta}
 
-    @app.get("/api/workspace/projects/{name}/reports/{filename}", summary="读取报告内容")
+    @app.get("/api/workspace/projects/{name}/reports/{filename}", summary="读取报告内容", dependencies=[Depends(verify_api_key)])
     async def read_project_report(name: str, filename: str):
-        import re as _re
-        if not _re.match(r'^[\w.-]+$', name) or not _re.match(r'^[\w.-]+$', filename):
-            raise HTTPException(status_code=400, detail="Invalid name")
-        fpath = projects_dir / name / "reports" / filename
-        if not fpath.exists() or not fpath.is_file():
-            raise HTTPException(status_code=404, detail=f"Report not found: {filename}")
-        # Security: ensure path is under projects_dir
+        # 验证项目名
+        proj = _validate_project_path(name)
+        # 验证文件名
+        safe_filename = _validate_filename(filename)
+        # 构造安全路径
+        fpath = (proj / "reports" / safe_filename).resolve()
+        reports_dir = (proj / "reports").resolve()
+        # 验证文件路径在 reports 目录内
         try:
-            fpath.resolve().relative_to(projects_dir.resolve())
+            fpath.relative_to(reports_dir)
         except ValueError:
             raise HTTPException(status_code=403, detail="Access denied")
+        if not fpath.exists() or not fpath.is_file():
+            raise HTTPException(status_code=404, detail=f"Report not found: {filename}")
         content = fpath.read_text(encoding="utf-8", errors="replace")
         return {
             "project": name,
@@ -250,12 +366,10 @@ def create_app(core: KimiSecCore) -> FastAPI:
             "content": content,
         }
 
-    @app.get("/api/workspace/projects/{name}/blackboard", summary="读取项目 Blackboard")
+    @app.get("/api/workspace/projects/{name}/blackboard", summary="读取项目 Blackboard", dependencies=[Depends(verify_api_key)])
     async def read_project_blackboard(name: str):
-        import re as _re
-        if not _re.match(r'^[\w.-]+$', name):
-            raise HTTPException(status_code=400, detail="Invalid project name")
-        bb = projects_dir / name / ".blackboard.json"
+        proj = _validate_project_path(name)
+        bb = proj / ".blackboard.json"
         if not bb.exists():
             raise HTTPException(status_code=404, detail="Blackboard not found")
         try:
@@ -264,17 +378,14 @@ def create_app(core: KimiSecCore) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Parse error: {e}")
 
-    @app.delete("/api/workspace/projects/{name}", summary="删除项目（清理磁盘）")
+    @app.delete("/api/workspace/projects/{name}", summary="删除项目（清理磁盘）", dependencies=[Depends(verify_api_key)])
     async def delete_project(name: str):
-        import re as _re
-        if not _re.match(r'^[\w.-]+$', name):
-            raise HTTPException(status_code=400, detail="Invalid project name")
-        proj = projects_dir / name
+        proj = _validate_project_path(name)
         if not proj.exists():
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
         import shutil as _shutil
         try:
-            _shutil.rmtree(proj)
+            _shutil.rmtree(str(proj))
             return {"ok": True, "message": f"Deleted project '{name}'"}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
@@ -283,6 +394,20 @@ def create_app(core: KimiSecCore) -> FastAPI:
 
     @app.websocket("/ws/events")
     async def ws_events(websocket: WebSocket):
+        # Authenticate WebSocket connection
+        # API key can be passed as query parameter: ?api_key=xxx
+        api_key = websocket.query_params.get("api_key") or websocket.headers.get("X-API-Key")
+
+        # Verify API key
+        expected_key = os.environ.get("KIMISEC_API_KEY")
+        if not expected_key:
+            await websocket.close(code=4000, reason="Server configuration error")
+            return
+
+        if not api_key or not (api_key == expected_key):
+            await websocket.close(code=4001, reason="Unauthorized: Invalid or missing API key")
+            return
+
         if not core.redis_url:
             await websocket.close(code=4000, reason="Redis not configured")
             return

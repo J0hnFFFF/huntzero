@@ -783,7 +783,10 @@ class Blackboard:
             else:
                 broadcast_data = asdict(self.hypotheses[h_id])
                 await self._broadcast("hypothesis_added", broadcast_data)
-        self._persist()
+
+            # FIX: 在锁内调用 _persist()，防止竞态条件
+            # 原代码在锁外调用 _persist()，导致其他协程可能在持久化前修改数据
+            self._persist()
         return h_id
 
     async def update_hypothesis(self, h_id: str, **kwargs):
@@ -795,8 +798,10 @@ class Blackboard:
                 if hasattr(node, k):
                     setattr(node, k, v)
 
+            # FIX: 在锁内调用 _persist()，防止竞态条件
+            self._persist()
+
         await self._broadcast("hypothesis_updated", {"id": h_id, **kwargs})
-        self._persist()
 
     # ── 任务操作 ────────────────────────────────
 
@@ -841,8 +846,10 @@ class Blackboard:
                 self.hypotheses[hypothesis_id].tasks.append(t_id)
                 self.hypotheses[hypothesis_id].status = HypothesisStatus.ACTIVE
 
+            # FIX: 在锁内调用 _persist()，防止竞态条件
+            self._persist()
+
         await self._broadcast("task_added", asdict(task))
-        self._persist()
         return t_id
 
     async def update_task(self, t_id: str, **kwargs):
@@ -858,8 +865,10 @@ class Blackboard:
             ):
                 task.completed_at = time.time()
 
+            # FIX: 在锁内调用 _persist()，防止竞态条件
+            self._persist()
+
         await self._broadcast("task_updated", {"id": t_id, **kwargs})
-        self._persist()
 
     # ── 发现操作 ────────────────────────────────
 
@@ -965,9 +974,11 @@ class Blackboard:
             if hypothesis_id in self.hypotheses:
                 self.hypotheses[hypothesis_id].status = HypothesisStatus.CONFIRMED
 
+            # FIX: 在锁内调用 _persist()，防止竞态条件
+            self._persist()
+
         await self._broadcast("finding_added", asdict(finding))
         self._write_audit_notes()
-        self._persist()
         return f_id
 
     @staticmethod

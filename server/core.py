@@ -381,9 +381,43 @@ class KimiSecCore:
         )
 
     @staticmethod
+    def _sanitize_repo_name(url: str) -> Optional[str]:
+        """
+        从 URL 提取并净化仓库名称，阻止路径遍历。
+
+        Security:
+        - URL 解码后验证名称
+        - 拒绝包含 '..' 或路径分隔符的名称
+        - 只允许安全字符（字母、数字、下划线、连字符、点号）
+        - 必须以字母或数字开头
+        """
+        import urllib.parse
+        import re
+
+        # 提取最后一段作为仓库名
+        raw_name = url.rstrip("/").split("/")[-1]
+        # URL 解码
+        repo_name = urllib.parse.unquote(raw_name)
+        # 移除 .git 后缀
+        repo_name = repo_name.replace(".git", "")
+        # 移除所有非安全字符
+        repo_name = re.sub(r'[^a-zA-Z0-9._-]', '', repo_name)
+        # 显式阻止 '..' 和 '.' 危险模式
+        if '..' in repo_name or repo_name == '.' or repo_name.startswith('.'):
+            return None
+        # 必须以字母或数字开头
+        if not repo_name or not repo_name[0].isalnum():
+            return None
+        return repo_name
+
+    @staticmethod
     async def prepare_git_target(url: str, work_dir: Path) -> Optional[Path]:
         """克隆 Git 仓库（与 kimi_hive.prepare_git_target 逻辑一致，日志用 logging）。"""
-        repo_name  = url.rstrip("/").split("/")[-1].replace(".git", "")
+        repo_name = KimiSecCore._sanitize_repo_name(url)
+        if repo_name is None:
+            logger.error("Invalid repository name in URL: %s", url)
+            return None
+
         projects   = work_dir / "projects"
         projects.mkdir(parents=True, exist_ok=True)
         target_dir = projects / repo_name

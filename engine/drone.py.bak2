@@ -8,7 +8,6 @@ import re
 import sys
 import uuid
 import yaml
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -178,63 +177,7 @@ class Drone:
         return cls._session_pool
 
     # ── 执行入口 ───────────────────────────────────────────────────────
-    # ── Session 获取上下文管理器 ────────────────────────────────────────────────────
 
-    @asynccontextmanager
-    async def _acquire_session(self):
-        """
-        统一的 Session 获取上下文管理器。
-
-        Security & Correctness:
-        - 使用 async with 确保 Session 正确释放
-        - 无论是否从池中获取，都能正确清理
-        - 异常情况下也能保证资源释放
-        """
-        pool = self._session_pool or getattr(Drone, "_session_pool", None)
-        session = None
-        from_pool = False
-        pool_cm = None
-
-        try:
-            if pool is not None:
-                # 尝试从池中获取
-                pool_cm = pool.acquire(self.drone_role)
-                try:
-                    async with pool_cm as pooled_session:
-                        if pooled_session is not None:
-                            session = pooled_session
-                            from_pool = True
-                            # 确保目标链接存在
-                            slot = getattr(pool_cm, "_slot", None)
-                            sandbox_dir = getattr(slot, "sandbox_dir", None)
-                            if sandbox_dir is not None:
-                                self._ensure_target_link(Path(sandbox_dir))
-                            yield session, from_pool
-                            return  # 正常退出 async with
-                except Exception:
-                    # 池获取失败，降级到按需创建
-                    if pool_cm is not None:
-                        try:
-                            await pool_cm.__aexit__(*sys.exc_info())
-                        except Exception:
-                            pass
-                    pool_cm = None
-
-            # 池未配置或池获取失败：创建新 session
-            session = await self._build_session()
-            from_pool = False
-            yield session, from_pool
-
-        finally:
-            # 如果不是从池中获取的，需要手动关闭
-            if not from_pool and session is not None and hasattr(session, "close"):
-                try:
-                    await session.close()
-                except Exception:
-                    pass
-            self._cleanup()
-
-    
     async def execute(self) -> str:
         """
         运行任务并返回文本输出。
@@ -249,11 +192,45 @@ class Drone:
         from kimi_agent_sdk import TextPart, ThinkPart, ToolCall, ToolResult
         import time as _time
 
+        pool = self._session_pool or getattr(Drone, "_session_pool", None)
         all_rounds: list[dict] = []
         final_text = ""
+        _from_pool = False
+        pool_context = None
+        session = None
 
-        # ── 使用统一的 Session 管理器 ────────────────────────────────────────────
-        async with self._acquire_session() as (session, from_pool):
+        # ── Bug-15 修复：整个执行流程必须在 `async with pool.acquire()` 范围内 ──
+        # Bug-14 修复：_from_pool 标记决定 finally 是否调用 session.close()。
+        try:
+            if pool is not None:
+                try:
+                    pool_context = pool.acquire(self.drone_role)
+                    pooled_session = await pool_context.__aenter__()
+                    if pooled_session is not None:
+                        session = pooled_session
+                        _from_pool = True
+                        slot = getattr(pool_context, "_slot", None)
+                        sandbox_dir = getattr(slot, "sandbox_dir", None)
+                        if sandbox_dir is not None:
+                            self._ensure_target_link(Path(sandbox_dir))
+                    else:
+                        await pool_context.__aexit__(None, None, None)
+                        pool_context = None
+                        session = await self._build_session()
+                        _from_pool = False
+                except Exception:
+                    if pool_context is not None:
+                        try:
+                            await pool_context.__aexit__(*sys.exc_info())
+                        except Exception:
+                            pass
+                        pool_context = None
+                    session = await self._build_session()
+                    _from_pool = False
+            else:
+                session = await self._build_session()
+                _from_pool = False
+
             # ── 构建 prompt ────────────────────────────────────────────
             target_hint = (
                 f"Target project root: {self._original_work_dir}\n"
@@ -366,7 +343,15 @@ class Drone:
                 else:
                     break
 
-        # Session 清理由 _acquire_session() 上下文管理器自动处理
+        finally:
+            if _from_pool and pool_context is not None:
+                try:
+                    await pool_context.__aexit__(*sys.exc_info())
+                except Exception:
+                    pass
+            # Bug-14 修复：只有非池 session 才手动关闭
+            if not _from_pool and session is not None and hasattr(session, "close"):
+                await session.close()
             self._cleanup()
 
         if len(all_rounds) > 1:
