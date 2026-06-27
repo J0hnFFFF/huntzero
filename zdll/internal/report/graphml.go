@@ -33,7 +33,7 @@ func (r *GraphMLRenderer) Render(bb *core.Blackboard, target string, elapsed tim
 		b.WriteString("    </node>\n")
 	}
 
-	for _, f := range bb.Findings {
+	for _, f := range bb.SortedFindings() {
 		fmt.Fprintf(&b, "    <node id=\"%s\">\n", f.ID)
 		fmt.Fprintf(&b, "      <data key=\"label\">%s</data>\n", escapeXML(f.Title))
 		fmt.Fprintf(&b, "      <data key=\"color\">%s</data>\n", severityColor(f.Severity))

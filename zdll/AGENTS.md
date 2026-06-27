@@ -6,7 +6,7 @@
 - Module: `github.com/kimisec/zdll`
 - Go: 1.25.0
 - Stack: Go CLI only (Wails desktop client removed)
-- LLM SDK: `github.com/MoonshotAI/kimi-agent-sdk/go`
+- LLM framework: `github.com/cloudwego/eino` (OpenAI-compatible ChatModel + ReAct agent + native tools)
 
 ## Build Commands
 
@@ -31,8 +31,9 @@ $env:GOPROXY='direct'; $env:CC='C:\ProgramData\mingw64\mingw64\bin\gcc.exe'; go 
 
 ## Architecture Notes
 
-- `internal/core` owns the engine, blackboard, drones, session pool, doc-intel, critic, sector coordinator, tree-sitter scanner, and `Location`/`changed paths` context helpers. It does not depend on CLI or the Kimi SDK directly.
-- `internal/llm` wraps the official Kimi Go SDK and builds agent YAML files from `.bots.md`.
+- `internal/core` owns the engine, blackboard, drones, doc-intel, critic, sector coordinator, tree-sitter scanner, and `Location`/`changed paths` context helpers. It does not depend on CLI or the LLM SDK directly.
+- `internal/llm` defines the `AgentRunner` / `AgentConfig` contracts used by `core`.
+- `internal/agent` is the Eino-based LLM layer: ChatModel setup, Cerebrum runner (single-shot), Drone runner (ReAct tool-calling agent), and native Go tool implementations (`bash`, `read_file`, `write_file`, `grep_search`, `glob`, `fetch_url`).
 - `internal/scanner` contains the OSV bridge (with auto-download), the semantic scanner, and the `git diff` helper used by `--diff-base`.
 - `internal/report` renders Markdown/JSON/SARIF/DOT/GraphML and provides stable finding keys for baseline comparison.
 - `internal/app` is the application service layer shared by the CLI.
@@ -42,9 +43,13 @@ $env:GOPROXY='direct'; $env:CC='C:\ProgramData\mingw64\mingw64\bin\gcc.exe'; go 
 
 ```powershell
 # Set API key via environment (recommended)
-$env:KIMI_API_KEY='sk-...'
-$env:KIMI_BASE_URL='https://api.kimi.com/coding/v1'   # optional, default already set
-$env:KIMI_MODEL_NAME='kimi-for-coding'                 # optional
+$env:ZDLL_LLM_API_KEY='sk-...'
+# Optional overrides
+$env:ZDLL_LLM_PROVIDER='anthropic'          # anthropic | openai
+$env:ZDLL_LLM_BASE_URL='https://api.kimi.com/coding'
+$env:ZDLL_LLM_MODEL_NAME='kimi-for-coding'
+
+# KIMI_API_KEY is also accepted as a fallback for API key only.
 
 # Or edit ~/.config/zdll/config.yaml after `zdll config init`
 
@@ -87,7 +92,7 @@ zdll config init
 - `zdll report <target> --format markdown|json|sarif|dot|graphml --output report.md` — render a report from a workspace.
 - `zdll list` — list persisted workspaces with status and last update time.
 - `zdll config init` — create default config in `~/.config/zdll/config.yaml`.
-- `zdll config validate` — load config and verify that `KIMI_API_KEY` is set.
+- `zdll config validate` — load config and verify that an LLM API key is set.
 
 Configuration priority: command-line flags → environment variables → `~/.config/zdll/config.yaml` → defaults.
 

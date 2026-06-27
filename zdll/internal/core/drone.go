@@ -5,13 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
 	"zdll/internal/llm"
+	"zdll/internal/util"
 )
 
 const (
@@ -20,9 +24,15 @@ const (
 	droneMinRoundTimeout = 120 * time.Second
 )
 
-var passthroughRoles = map[string]bool{
-	"scope-definer": true,
-	"doc-analyst":   true,
+// isPassthroughRole reports whether the drone role should pass through without
+// the multi-round chase loop. Using a function instead of a mutable package map
+// keeps the role set effectively read-only.
+func isPassthroughRole(role string) bool {
+	switch role {
+	case "scope-definer", "doc-analyst":
+		return true
+	}
+	return false
 }
 
 // reportLikeExtensions matches file extensions considered report-like.
@@ -90,26 +100,28 @@ var extensionMap = map[string]string{
 // Each drone receives a highly specific micro-task, runs it in an isolated
 // sandbox, and returns a structured result.
 type Drone struct {
-	TaskID          string
-	TaskDesc        string
-	DroneRole       string
-	WorkDir         string // original target project
-	RootDir         string // zdll root
-	Config          any    // unused but kept for compatibility
-	originalWorkDir string
-	sandbox       string
-	agentFile     string
-	ownsSandbox   bool
+	TaskID              string
+	TaskDesc            string
+	DroneRole           string
+	WorkDir             string // original target project
+	RootDir             string // zdll root
+	ArtifactsDir        string // directory for PoCs, harnesses, and harvested reports
+	Config              any    // unused but kept for compatibility
+	originalWorkDir     string
+	sandbox             string
+	ownsSandbox         bool
+	effectiveTargetRoot string
 }
 
 // NewDrone creates a new Drone instance.
-func NewDrone(taskID, taskDesc, droneRole, workDir, rootDir string) *Drone {
+func NewDrone(taskID, taskDesc, droneRole, workDir, rootDir, artifactsDir string) *Drone {
 	return &Drone{
 		TaskID:          taskID,
 		TaskDesc:        taskDesc,
 		DroneRole:       droneRole,
 		WorkDir:         workDir,
 		RootDir:         rootDir,
+		ArtifactsDir:    artifactsDir,
 		originalWorkDir: workDir,
 	}
 }
@@ -119,6 +131,7 @@ func (d *Drone) Execute(ctx context.Context, runner llm.AgentRunner) (string, er
 	if runner == nil {
 		return "", errors.New("runner is nil")
 	}
+	log.Printf("[drone] %s Execute start (role=%s)", d.TaskID, d.DroneRole)
 
 	safeTaskID := sanitizeTaskID(d.TaskID)
 	sandbox := filepath.Join(d.RootDir, "tmp", ".drone_sandboxes", safeTaskID)
@@ -135,22 +148,26 @@ func (d *Drone) Execute(ctx context.Context, runner llm.AgentRunner) (string, er
 		effectiveWorkDir = d.originalWorkDir
 	}
 
-	agentFile, err := llm.BuildAgentYAML(d.RootDir, d.DroneRole, "")
-	if err != nil {
-		return "", fmt.Errorf("build agent yaml: %w", err)
-	}
-	d.agentFile = agentFile
-
 	cfg := llm.AgentConfig{
 		WorkDir:     effectiveWorkDir,
-		AgentFile:   d.agentFile,
 		AutoApprove: true,
+	}
+
+	// Resolve the effective target root for path guidance. If a _target symlink
+	// exists inside the sandbox, the drone must prefix relative paths with it;
+	// otherwise the effective workDir already points at the original project.
+	if effectiveWorkDir == d.sandbox {
+		d.effectiveTargetRoot = "./_target"
+	} else {
+		d.effectiveTargetRoot = "."
 	}
 
 	promptFn := func(ctx context.Context, prompt string) (string, error) {
 		return runAgentRoundWithRunner(ctx, runner, cfg, prompt)
 	}
+	log.Printf("[drone] %s starting chase", d.TaskID)
 	finalText, err := d.runChase(ctx, promptFn)
+	log.Printf("[drone] %s chase done (err=%v, text=%d chars)", d.TaskID, err, len(finalText))
 
 	if cerr := d.cleanup(); cerr != nil && err == nil {
 		err = cerr
@@ -159,39 +176,18 @@ func (d *Drone) Execute(ctx context.Context, runner llm.AgentRunner) (string, er
 	return finalText, err
 }
 
-// ExecuteWithSession runs the drone task using a reusable pooled session.
-func (d *Drone) ExecuteWithSession(ctx context.Context, session AgentSession, sandboxDir string) (string, error) {
-	if session == nil {
-		return "", errors.New("session is nil")
-	}
-
-	d.sandbox = sandboxDir
-	d.ownsSandbox = false
-	if err := EnsureAcquireTargetLink(sandboxDir, d.originalWorkDir); err != nil {
-		return "", fmt.Errorf("target link: %w", err)
-	}
-
-	promptFn := func(ctx context.Context, prompt string) (string, error) {
-		return session.Prompt(ctx, prompt)
-	}
-
-	text, err := d.runChase(ctx, promptFn)
-	// Harvest artifacts from the shared slot sandbox, but do not remove it.
-	d.harvestArtifacts()
-	return text, err
-}
-
 // promptFunc executes a single prompt and returns the text response.
 type promptFunc func(ctx context.Context, prompt string) (string, error)
 
 func (d *Drone) runChase(ctx context.Context, fn promptFunc) (string, error) {
 	maxRounds := droneMaxChaseRounds
-	if passthroughRoles[d.DroneRole] {
+	if isPassthroughRole(d.DroneRole) {
 		maxRounds = 1
 	}
 
 	allRounds := make([]map[string]any, 0, maxRounds)
 	var finalText string
+	var runErr error
 	start := time.Now()
 
 	for round := 0; round < maxRounds; round++ {
@@ -217,6 +213,7 @@ func (d *Drone) runChase(ctx context.Context, fn promptFunc) (string, error) {
 		timedOut := ctx.Err() == context.DeadlineExceeded || (err != nil && errors.Is(err, context.DeadlineExceeded))
 		if err != nil && !timedOut {
 			roundText += fmt.Sprintf("\n[SYSTEM ERROR] Drone execution caught an exception: %v\n", err)
+			runErr = err
 		}
 		if timedOut {
 			roundText += fmt.Sprintf(
@@ -244,12 +241,14 @@ func (d *Drone) runChase(ctx context.Context, fn promptFunc) (string, error) {
 	if len(allRounds) > 1 {
 		finalText = synthesizeMultiRound(allRounds, finalText)
 	}
-	return finalText, nil
+	return finalText, runErr
 }
 
 func runAgentRoundWithRunner(ctx context.Context, runner llm.AgentRunner, cfg llm.AgentConfig, prompt string) (string, error) {
+	log.Printf("[drone] runAgentRoundWithRunner prompt=%d chars", len(prompt))
 	events, err := runner.Run(ctx, cfg, prompt)
 	if err != nil {
+		log.Printf("[drone] runner.Run returned error: %v", err)
 		return "", err
 	}
 	var text string
@@ -262,22 +261,24 @@ func runAgentRoundWithRunner(ctx context.Context, runner llm.AgentRunner, cfg ll
 			runErr = errors.New(ev.Content)
 		}
 	}
+	log.Printf("[drone] runAgentRoundWithRunner done (text=%d chars, runErr=%v)", len(text), runErr)
 	return text, runErr
 }
 
 func (d *Drone) buildInitialPrompt() string {
 	targetHint := fmt.Sprintf(
-		"Target project root: %s\nIf ./_target exists in your working directory, use it as the read-only project link.\n\n",
+		"Target project root: %s\nUse relative paths from the current working directory to access source files.\n\n",
 		d.originalWorkDir,
 	)
-	if passthroughRoles[d.DroneRole] {
+	base := d.systemPromptPrefix()
+	if isPassthroughRole(d.DroneRole) {
 		return fmt.Sprintf(
-			"[DRONE TASK: %s]\nRole: %s\n\n%s%s",
-			d.TaskID, d.DroneRole, targetHint, d.TaskDesc,
+			"%s\n\n[DRONE TASK: %s]\nRole: %s\n\n%s%s",
+			base, d.TaskID, d.DroneRole, targetHint, d.TaskDesc,
 		)
 	}
 	return fmt.Sprintf(
-		"[DRONE TASK: %s]\nRole: %s\n\n%sTask:\n%s\n\n"+
+		"%s\n\n[DRONE TASK: %s]\nRole: %s\n\n%sTask:\n%s\n\n"+
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"+
 			"IMPORTANT: Before reporting any finding, you MUST first answer these\n"+
 			"screening questions based on your actual code investigation:\n\n"+
@@ -286,6 +287,9 @@ func (d *Drone) buildInitialPrompt() string {
 			"MITIGATED: Is there upstream validation or defense that prevents exploitation? [yes/no/unknown]\n\n"+
 			"Only report a finding if REACHABLE != no AND EXPLOITABLE != no AND MITIGATED != yes.\n"+
 			"If any screening question indicates the issue is not exploitable, report SEVERITY: none.\n\n"+
+			"EFFICIENCY: Use at most 3-5 tool calls to gather evidence. Do not iterate endlessly.\n"+
+			"After gathering sufficient evidence (or determining none exists), you MUST\n"+
+			"immediately output your final answer in the exact format below.\n\n"+
 			"Return your analysis in this exact format:\n\n"+
 			"REACHABLE: <yes/no/unknown — with brief justification>\n"+
 			"EXPLOITABLE: <yes/no/unknown — with brief justification>\n"+
@@ -299,24 +303,89 @@ func (d *Drone) buildInitialPrompt() string {
 			"If you found something but need to trace further, end with:\n"+
 			"TRACE_NEEDED: <specific question to answer in the next round>\n"+
 			"TRACE_TARGET: <file path, function name, or code pattern to investigate>",
-		d.TaskID, d.DroneRole, targetHint, d.TaskDesc,
+		base, d.TaskID, d.DroneRole, targetHint, d.TaskDesc,
 	)
+}
+
+func (d *Drone) systemPromptPrefix() string {
+	var parts []string
+
+	botsPath := filepath.Join(d.RootDir, ".bots.md")
+	if data, err := os.ReadFile(botsPath); err == nil {
+		parts = append(parts, string(data))
+	}
+
+	parts = append(parts, fmt.Sprintf(
+		"You are a precision analysis drone. Role: %s.\n"+
+			"Execute your assigned task with maximum specificity. "+
+			"Use available tools (file read, shell, search) to gather concrete evidence. "+
+			"Return only what you can prove with code or data. "+
+			"Do NOT assume any broader methodology. Follow task instructions strictly.",
+		d.DroneRole,
+	))
+
+	parts = append(parts,
+		"[HARD CONSTRAINT - SYSTEM SAFETY]\n"+
+			"1. You are a specialized worker drone. Use the Exploration Channel (grep_search) and Verification Channel (Python AST via bash) to establish concrete proof for your designated task.\n"+
+			"2. NEVER execute dangerous or destructive exploits (e.g., rm -rf, formatting) that compromise the host.\n"+
+			"3. If your task requires crafting PoCs, exploit scripts, or report documents, write them into the `./pocs/` subdirectory (create it if it does not exist). "+
+			"This is the ONLY directory that is guaranteed to be preserved after your session ends. "+
+			"Writing files to the current working directory root will cause them to be LOST.\n"+
+			"4. DO NOT run long-standing web servers or heavy test frameworks unless explicitly instructed.\n"+
+			"5. Your primary objective is to find concrete evidence. Base your conclusions solely on verifiable code structure.\n"+
+			"6. DO NOT get stuck in infinite loop tool executions. If a tool command fails 2 times, CHANGE YOUR APPROACH or STOP analysis.",
+	)
+
+	if guidelines := d.loadHarnessGuidelines(); guidelines != "" {
+		parts = append(parts, guidelines)
+	}
+
+	return strings.Join(parts, "\n\n")
+}
+
+func (d *Drone) loadHarnessGuidelines() string {
+	if d.DroneRole != "harness-generator" || d.RootDir == "" {
+		return ""
+	}
+	skillsDir := filepath.Join(d.RootDir, "skills")
+	entries, err := os.ReadDir(skillsDir)
+	if err != nil {
+		return ""
+	}
+
+	var parts []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		path := filepath.Join(skillsDir, e.Name(), "references", "fuzz-harness.md")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("--- Fuzz Harness Guidelines (%s) ---\n%s", e.Name(), string(data)))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+	return "[DOMAIN HARNESS GUIDELINES]\n\n" + strings.Join(parts, "\n\n")
 }
 
 func (d *Drone) buildChasePrompt(rounds []map[string]any, chaseRound int) string {
 	prev := rounds[len(rounds)-1]
 
-	findingSummary := truncateString(stringValue(prev["finding"]), 300)
-	evidenceSummary := truncateString(stringValue(prev["evidence"]), 2000)
-	traceQuestion := stringValue(prev["trace_needed"])
-	traceTarget := stringValue(prev["trace_target"])
-	prevConfidence := floatValue(prev["confidence"])
+	findingSummary := truncateString(util.StringValue(prev["finding"]), 300)
+	evidenceSummary := truncateString(util.StringValue(prev["evidence"]), 2000)
+	traceQuestion := util.StringValue(prev["trace_needed"])
+	traceTarget := util.StringValue(prev["trace_target"])
+	prevConfidence := util.FloatValue(prev["confidence"])
 
 	var chainSummary string
 	if len(rounds) > 1 {
 		var lines []string
 		for i, r := range rounds {
-			sev := stringValue(r["severity"])
+			sev := util.StringValue(r["severity"])
 			if sev == "" {
 				sev = "?"
 			}
@@ -324,7 +393,7 @@ func (d *Drone) buildChasePrompt(rounds []map[string]any, chaseRound int) string
 			if c, ok := r["confidence"].(float64); ok {
 				conf = fmt.Sprintf("%.2f", c)
 			}
-			finding := truncateString(stringValue(r["finding"]), 150)
+			finding := truncateString(util.StringValue(r["finding"]), 150)
 			if finding == "" {
 				finding = "?"
 			}
@@ -438,19 +507,24 @@ func runAgentRound(ctx context.Context, runner llm.AgentRunner, cfg llm.AgentCon
 }
 
 // parseRoundOutput extracts structured fields from drone text output.
+// The regexes are multiline-aware so fields can appear anywhere in the
+// model output, matching Python _parse_round_output behaviour.
 func parseRoundOutput(text string) map[string]any {
 	result := make(map[string]any)
 	patterns := []struct {
 		name    string
 		pattern string
 	}{
-		{"finding", `(?is)^FINDING:\s*(.+?)(?:\n|$)`},
-		{"severity", `(?is)^SEVERITY:\s*(\w+)`},
-		{"confidence", `(?is)^CONFIDENCE:\s*([0-9.]+)`},
-		{"evidence", `(?is)^EVIDENCE:\s*([\s\S]*?)(?:\nDETAIL:|\nTRACE_|$)`},
-		{"detail", `(?is)^DETAIL:\s*([\s\S]*?)(?:\nTRACE_|$)`},
-		{"trace_needed", `(?is)^TRACE_NEEDED:\s*(.+?)(?:\n|$)`},
-		{"trace_target", `(?is)^TRACE_TARGET:\s*(.+?)(?:\n|$)`},
+		{"finding", `(?im)^FINDING:\s*(.+?)(?:\n|$)`},
+		{"severity", `(?im)^SEVERITY:\s*(\w+)`},
+		{"confidence", `(?im)^CONFIDENCE:\s*([0-9.]+)`},
+		{"reachable", `(?im)^REACHABLE:\s*(yes|no|unknown)`},
+		{"exploitable", `(?im)^EXPLOITABLE:\s*(yes|no|unknown)`},
+		{"mitigated", `(?im)^MITIGATED:\s*(yes|no|unknown)`},
+		{"evidence", `(?ims)^EVIDENCE:\s*([\s\S]*?)(?:\nDETAIL:|\nTRACE_|$)`},
+		{"detail", `(?ims)^DETAIL:\s*([\s\S]*?)(?:\nTRACE_|$)`},
+		{"trace_needed", `(?im)^TRACE_NEEDED:\s*(.+?)(?:\n|$)`},
+		{"trace_target", `(?im)^TRACE_TARGET:\s*(.+?)(?:\n|$)`},
 	}
 
 	for _, p := range patterns {
@@ -477,14 +551,14 @@ func parseConfidence(s string) float64 {
 
 func evaluateChaseDecision(rounds []map[string]any) string {
 	current := rounds[len(rounds)-1]
-	severity := strings.ToLower(stringValue(current["severity"]))
-	confidence := floatValue(current["confidence"])
-	hasTrace := stringValue(current["trace_needed"]) != ""
+	severity := strings.ToLower(util.StringValue(current["severity"]))
+	confidence := util.FloatValue(current["confidence"])
+	hasTrace := util.StringValue(current["trace_needed"]) != ""
 
 	// Condition 1: drone explicitly requested a trace direction.
 	if hasTrace && severity != "" && severity != "none" {
 		if len(rounds) >= 2 {
-			prevConf := floatValue(rounds[len(rounds)-2]["confidence"])
+			prevConf := util.FloatValue(rounds[len(rounds)-2]["confidence"])
 			if confidence < prevConf-0.1 {
 				return "stop"
 			}
@@ -494,7 +568,7 @@ func evaluateChaseDecision(rounds []map[string]any) string {
 
 	// Condition 2: medium/high finding but confidence is low.
 	if severity == "critical" || severity == "high" || severity == "medium" {
-		rawLen := intValue(current["raw_length"])
+		rawLen := util.IntValue(current["raw_length"])
 		if confidence < 0.75 && rawLen > 100 {
 			return "continue"
 		}
@@ -506,7 +580,7 @@ func evaluateChaseDecision(rounds []map[string]any) string {
 func synthesizeMultiRound(rounds []map[string]any, lastRaw string) string {
 	var allEvidence []string
 	for i, r := range rounds {
-		if ev := stringValue(r["evidence"]); ev != "" {
+		if ev := util.StringValue(r["evidence"]); ev != "" {
 			allEvidence = append(allEvidence, fmt.Sprintf("[Round %d] %s", i, ev))
 		}
 	}
@@ -527,11 +601,14 @@ func (d *Drone) extractPocsFromText(text string, roundIdx int) {
 		return
 	}
 
-	destDir := d.originalWorkDir
+	// PoCs and harnesses are written to an isolated directory under the zdll
+	// tmp tree rather than inside the target project, reducing the risk of
+	// accidentally executing or committing LLM-generated artifacts.
+	destDir := d.artifactDir()
 	if d.DroneRole == "harness-generator" {
-		destDir = filepath.Join(d.originalWorkDir, "fuzz_jobs", sanitizeTaskID(d.TaskID))
+		destDir = filepath.Join(destDir, "fuzz_jobs", sanitizeTaskID(d.TaskID))
 	} else {
-		destDir = filepath.Join(d.originalWorkDir, "pocs")
+		destDir = filepath.Join(destDir, "pocs")
 	}
 	_ = os.MkdirAll(destDir, 0o755)
 
@@ -565,16 +642,12 @@ func (d *Drone) extractPocsFromText(text string, roundIdx int) {
 			targetPath = filepath.Join(destDir, fmt.Sprintf("%s_r%d_poc_%d.%s", safeTaskID, roundIdx, i+1, ext))
 		}
 
-		_ = os.WriteFile(targetPath, []byte(trimmed+"\n"), 0o644)
+		// Write as non-executable to discourage accidental execution.
+		_ = os.WriteFile(targetPath, []byte(trimmed+"\n"), 0o600)
 	}
 }
 
 func (d *Drone) cleanup() error {
-	if d.ownsSandbox {
-		if d.agentFile != "" {
-			_ = os.Remove(d.agentFile)
-		}
-	}
 	d.harvestArtifacts()
 	if d.ownsSandbox && d.sandbox != "" {
 		return os.RemoveAll(d.sandbox)
@@ -592,8 +665,9 @@ func (d *Drone) harvestArtifacts() {
 		return
 	}
 
-	pocsDir := filepath.Join(d.originalWorkDir, "pocs")
-	reportsDir := filepath.Join(d.originalWorkDir, "reports")
+	baseDir := d.artifactDir()
+	pocsDir := filepath.Join(baseDir, "pocs")
+	reportsDir := filepath.Join(baseDir, "reports")
 
 	for _, entry := range entries {
 		if entry.IsDir() || strings.HasPrefix(entry.Name(), "_") {
@@ -661,6 +735,15 @@ func ensureSymlink(link, target string) error {
 	target = filepath.Clean(target)
 	link = filepath.Clean(link)
 
+	// On Windows, directory junctions do not require privilege and do not suffer
+	// from the "file symlink to a directory" quirk that os.Symlink can create.
+	// For directory targets we therefore prefer a junction.
+	if runtime.GOOS == "windows" {
+		if fi, err := os.Stat(target); err == nil && fi.IsDir() {
+			return ensureJunction(link, target)
+		}
+	}
+
 	info, err := os.Lstat(link)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -679,6 +762,59 @@ func ensureSymlink(link, target string) error {
 	return os.Symlink(target, link)
 }
 
+// ensureJunction creates or re-creates a Windows directory junction pointing to
+// target. Directory junctions are used instead of symlinks because they work
+// without elevation and reliably present the target as a directory.
+func ensureJunction(link, target string) error {
+	link = filepath.Clean(link)
+	target = filepath.Clean(target)
+
+	info, err := os.Lstat(link)
+	if err == nil {
+		// If it's already a directory (junctions look like directories), verify
+		// the target. Do NOT use os.Remove on a junction — it would delete the
+		// target contents. Use rmdir instead.
+		if info.IsDir() {
+			if dest, err := resolveJunctionTarget(link); err == nil && filepath.Clean(dest) == target {
+				return nil
+			}
+			if err := os.Remove(link); err != nil {
+				return err
+			}
+		} else {
+			if err := os.Remove(link); err != nil {
+				return err
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	cmd := exec.Command("cmd", "/c", "mklink", "/J", link, target)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mklink /J %s %s failed: %v (%s)", link, target, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// resolveJunctionTarget returns the target of a Windows directory junction.
+func resolveJunctionTarget(link string) (string, error) {
+	parent := filepath.Dir(link)
+	name := filepath.Base(link)
+	cmd := exec.Command("cmd", "/c", "dir", parent, "/AL")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	// Output line looks like: 06/26/2026  01:23 AM    <JUNCTION>     link [C:\target]
+	re := regexp.MustCompile(`<JUNCTION>\s+` + regexp.QuoteMeta(name) + `\s+\[(.*?)\]`)
+	if m := re.FindStringSubmatch(string(out)); len(m) == 2 {
+		return m[1], nil
+	}
+	return "", fmt.Errorf("junction target not found in dir output")
+}
+
 func copyFile(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -694,6 +830,16 @@ func copyFile(src, dst string, mode os.FileMode) error {
 
 	_, err = io.Copy(out, in)
 	return err
+}
+
+func (d *Drone) artifactDir() string {
+	if d.ArtifactsDir != "" {
+		return d.ArtifactsDir
+	}
+	if d.RootDir == "" {
+		return filepath.Join(d.originalWorkDir, "zdll_artifacts")
+	}
+	return filepath.Join(d.RootDir, "tmp", "zdll_artifacts", sanitizeTaskID(d.TaskID))
 }
 
 func sanitizeTaskID(id string) string {
@@ -721,48 +867,6 @@ func truncateString(s string, max int) string {
 		return s
 	}
 	return s[:max]
-}
-
-func stringValue(v any) string {
-	if v == nil {
-		return ""
-	}
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return fmt.Sprintf("%v", v)
-}
-
-func floatValue(v any) float64 {
-	if v == nil {
-		return 0.0
-	}
-	switch n := v.(type) {
-	case float64:
-		return n
-	case float32:
-		return float64(n)
-	case int:
-		return float64(n)
-	case int64:
-		return float64(n)
-	}
-	return 0.0
-}
-
-func intValue(v any) int {
-	if v == nil {
-		return 0
-	}
-	switch n := v.(type) {
-	case int:
-		return n
-	case int64:
-		return int(n)
-	case float64:
-		return int(n)
-	}
-	return 0
 }
 
 func hasAnyKeyword(s string, keywords map[string]bool) bool {

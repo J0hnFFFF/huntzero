@@ -79,24 +79,24 @@ func (b *BloomDeduplicator) Stats() map[string]int {
 
 // securitySynonyms normalizes common security terms for deduplication.
 var securitySynonyms = map[string]string{
-	"xss":            "cross_site_scripting",
-	"cross site":     "cross_site_scripting",
-	"cross-site":     "cross_site_scripting",
-	"sqli":           "sql_injection",
-	"sql injection":  "sql_injection",
-	"sql-injection":  "sql_injection",
-	"rce":            "remote_code_execution",
-	"lfi":            "local_file_include",
-	"rfi":            "remote_file_include",
-	"ssrf":           "server_side_request_forgery",
-	"csrf":           "cross_site_request_forgery",
-	"idor":           "insecure_direct_object_reference",
+	"xss":             "cross_site_scripting",
+	"cross site":      "cross_site_scripting",
+	"cross-site":      "cross_site_scripting",
+	"sqli":            "sql_injection",
+	"sql injection":   "sql_injection",
+	"sql-injection":   "sql_injection",
+	"rce":             "remote_code_execution",
+	"lfi":             "local_file_include",
+	"rfi":             "remote_file_include",
+	"ssrf":            "server_side_request_forgery",
+	"csrf":            "cross_site_request_forgery",
+	"idor":            "insecure_direct_object_reference",
 	"deserialization": "deserialize",
-	"deserialize":    "deserialize",
-	"unserialize":    "deserialize",
+	"deserialize":     "deserialize",
+	"unserialize":     "deserialize",
 	"buffer overflow": "buffer_overflow",
-	"oob":            "out_of_bounds",
-	"out-of-bounds":  "out_of_bounds",
+	"oob":             "out_of_bounds",
+	"out-of-bounds":   "out_of_bounds",
 }
 
 var (
@@ -119,8 +119,11 @@ var (
 func normalizeText(text string) []string {
 	lower := strings.ToLower(text)
 	lower = dedupNormalizer.ReplaceAllString(lower, " ")
+	// Apply security term synonyms as whole-word replacements only, so that
+	// short forms like "rfi" do not corrupt unrelated words (e.g. "dockerfile").
 	for from, to := range securitySynonyms {
-		lower = strings.ReplaceAll(lower, from, to)
+		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(from) + `\b`)
+		lower = re.ReplaceAllString(lower, to)
 	}
 	fields := strings.Fields(lower)
 	out := make([]string, 0, len(fields))
@@ -169,8 +172,10 @@ func charTrigrams(text string) map[string]struct{} {
 }
 
 func jaccard(a, b map[string]struct{}) float64 {
-	if len(a) == 0 && len(b) == 0 {
-		return 1.0
+	// Empty feature sets provide no evidence of similarity; treat as 0 instead
+	// of 1 to avoid merging unrelated short strings.
+	if len(a) == 0 || len(b) == 0 {
+		return 0.0
 	}
 	intersection := 0
 	for k := range a {
@@ -243,8 +248,23 @@ func findSimilarHypothesis(bb *Blackboard, description string, threshold float64
 		}
 		minLen := minInt(len(newUnigrams), len(hUnigrams))
 		anchorScore := 0.0
-		if minLen > 0 && float64(uniOverlap)/float64(minLen) >= 0.30 && (funcOverlap > 0 || fileOverlap > 0 || containsVulnKeyword(description)) {
-			anchorScore = 1.0
+		if minLen > 0 {
+			uniRatio := float64(uniOverlap) / float64(minLen)
+			// Lower the unigram bar when there is a file/function anchor or a
+			// recognized vulnerability-class keyword. This catches paraphrased
+			// duplicates that describe the same bug class in the same area.
+			if funcOverlap > 0 || fileOverlap > 0 {
+				if uniRatio >= 0.20 {
+					anchorScore = 1.0
+				}
+			} else if containsVulnKeyword(description) && uniRatio >= 0.25 {
+				anchorScore = 1.0
+			}
+		}
+		if anchorScore >= threshold {
+			bestID = h.ID
+			bestScore = anchorScore
+			continue
 		}
 
 		// Layer 1: structural fingerprint
@@ -343,23 +363,21 @@ func classifyHypothesisPolarity(description string) string {
 	return "positive"
 }
 
-// isTaskDuplicate checks task duplicate within same hypothesis + role.
+// isTaskDuplicate checks whether newDescription is a duplicate of an existing
+// task within the same hypothesis and drone role. The caller (AddTask) already
+// ensures hypothesis ID and role match, so this function only compares the
+// normalized descriptions using exact match and near-substring containment,
+// matching the Python engine behaviour.
 func isTaskDuplicate(existing *DroneTask, newDescription string) bool {
-	if existing.HypothesisID != "" && existing.DroneRole != "" {
-		// simplified: same hypothesis_id and role and substring containment
-		if existing.HypothesisID != "" {
-			// placeholder for exact logic
-		}
-	}
 	a := normalizeForTask(existing.Description)
 	b := normalizeForTask(newDescription)
 	if a == b {
 		return true
 	}
+	// Near-substring containment: one description is contained in the other
+	// and their lengths differ by at most 10 runes.
 	if strings.Contains(a, b) || strings.Contains(b, a) {
-		la := len([]rune(a))
-		lb := len([]rune(b))
-		if absInt(la-lb) <= 10 {
+		if absInt(len([]rune(a))-len([]rune(b))) <= 10 {
 			return true
 		}
 	}
@@ -418,4 +436,46 @@ func mergeEvidence(a, b string) string {
 		return a
 	}
 	return fmt.Sprintf("%s\n\n---\n\n%s", a, b)
+}
+
+// DeduplicateFindings merges findings whose titles and descriptions are highly
+// similar. It is intended as a second-pass filter for report rendering, where
+// title-only deduplication is not enough.
+func DeduplicateFindings(findings []*Finding) []*Finding {
+	if len(findings) <= 1 {
+		return findings
+	}
+	var out []*Finding
+	for _, f := range findings {
+		merged := false
+		for _, existing := range out {
+			if findingsSimilar(existing, f) {
+				if SeverityRank(f.Severity) > SeverityRank(existing.Severity) {
+					existing.Severity = f.Severity
+				}
+				existing.Evidence = mergeEvidence(existing.Evidence, f.Evidence)
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func findingsSimilar(a, b *Finding) bool {
+	if a.HypothesisID != "" && a.HypothesisID == b.HypothesisID {
+		return true
+	}
+	ta := make(map[string]struct{})
+	for _, t := range normalizeText(a.Title + " " + a.Description) {
+		ta[t] = struct{}{}
+	}
+	tb := make(map[string]struct{})
+	for _, t := range normalizeText(b.Title + " " + b.Description) {
+		tb[t] = struct{}{}
+	}
+	return jaccard(ta, tb) >= 0.55
 }

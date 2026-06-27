@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,35 +22,37 @@ import (
 // DefaultOSVTimeout is the maximum time allowed for an OSV scan.
 const DefaultOSVTimeout = 300 * time.Second
 
-// osvScannerVersion is the pinned release used for auto-download.
-const osvScannerVersion = "2.3.5"
-
 // OSVScanner wraps the Google osv-scanner binary.
 type OSVScanner struct {
-	Path string
+	Path    string
+	Offline bool
 }
 
 // NewOSVScanner creates an OSVScanner that uses the provided binary path.
+// By default it runs in online mode (matching the Python engine); set Offline
+// to true to pass --offline to osv-scanner.
 func NewOSVScanner(path string) *OSVScanner {
-	return &OSVScanner{Path: path}
+	return &OSVScanner{Path: path, Offline: false}
 }
 
 // Name returns the scanner identifier.
 func (s *OSVScanner) Name() string { return "osv" }
 
 // Scan runs osv-scanner against target and returns dependency findings.
-// If the binary cannot be found locally, it is downloaded from the official
-// GitHub release before the scan proceeds.
+// The binary must already be present on the system; this package does not
+// auto-download executables to avoid supply-chain risk.
 func (s *OSVScanner) Scan(ctx context.Context, target string) ([]*core.Finding, error) {
 	binary := s.Path
 	if binary == "" {
 		var ok bool
 		var err error
-		binary, ok, err = resolveOrInstallOSVScanner(nil)
+		// Try to discover the binary, including the target project's bin/ dir.
+		binary, ok, err = resolveOSVScanner(nil, target)
 		if err != nil {
-			return nil, fmt.Errorf("osv-scanner not available and could not be downloaded: %w", err)
+			return nil, fmt.Errorf("osv-scanner not available: %w", err)
 		}
 		if !ok {
+			log.Printf("warning: osv-scanner not found; install it from https://github.com/google/osv-scanner/releases or set OSV_SCANNER_PATH")
 			return []*core.Finding{}, nil
 		}
 	}
@@ -60,7 +60,10 @@ func (s *OSVScanner) Scan(ctx context.Context, target string) ([]*core.Finding, 
 	ctx, cancel := context.WithTimeout(ctx, DefaultOSVTimeout)
 	defer cancel()
 
-	args := []string{"scan", "source", "-r", "--offline", "--format", "json", target}
+	args := []string{"scan", "source", "-r", "--format", "json", target}
+	if s.Offline {
+		args = append(args[:3], append([]string{"--offline"}, args[3:]...)...)
+	}
 	cmd := exec.CommandContext(ctx, binary, args...)
 
 	var stdout, stderr bytes.Buffer
@@ -95,16 +98,12 @@ func (s *OSVScanner) Scan(ctx context.Context, target string) ([]*core.Finding, 
 // resolveOSVScanner discovers the osv-scanner binary using, in order:
 //  1. OSV_SCANNER_PATH environment variable
 //  2. Configured path from cfg.Paths.OSVScanner
-//  3. <repo>/bin/osv-scanner (or .exe on Windows)
+//  3. Each extra root's bin/osv-scanner (or .exe on Windows)
 //  4. PATH lookup via exec.LookPath
 //
-// resolveOrInstallOSVScanner discovers the osv-scanner binary using, in order:
-//  1. OSV_SCANNER_PATH environment variable
-//  2. Configured path from cfg.Paths.OSVScanner
-//  3. <repo>/bin/osv-scanner (or .exe on Windows)
-//  4. PATH lookup via exec.LookPath
-//  5. Auto-download to the user config tools directory
-func resolveOrInstallOSVScanner(cfg *config.Config) (string, bool, error) {
+// This function intentionally does not auto-download binaries. See the audit
+// remediation note in osv.go for the rationale.
+func resolveOSVScanner(cfg *config.Config, roots ...string) (string, bool, error) {
 	binaryName := "osv-scanner"
 	if runtime.GOOS == "windows" {
 		binaryName += ".exe"
@@ -122,117 +121,21 @@ func resolveOrInstallOSVScanner(cfg *config.Config) (string, bool, error) {
 		}
 	}
 
-	if localBin := findLocalOSVScanner(binaryName); localBin != "" {
-		return localBin, true, nil
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		candidate := filepath.Join(root, "bin", binaryName)
+		if isExecutableFile(candidate) {
+			return candidate, true, nil
+		}
 	}
 
 	if found, err := exec.LookPath(binaryName); err == nil {
 		return found, true, nil
 	}
 
-	// Auto-download from the official release.
-	dir, err := osvScannerInstallDir()
-	if err != nil {
-		return "", false, err
-	}
-	path, err := downloadOSVScanner(dir)
-	if err != nil {
-		return "", false, err
-	}
-	return path, true, nil
-}
-
-func osvScannerInstallDir() (string, error) {
-	cfgDir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	dir := filepath.Join(cfgDir, "zdll", "tools", "osv-scanner-"+osvScannerVersion)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	return dir, nil
-}
-
-func downloadOSVScanner(dir string) (string, error) {
-	assetName, err := osvScannerAssetName()
-	if err != nil {
-		return "", err
-	}
-	url := fmt.Sprintf("https://github.com/google/osv-scanner/releases/download/v%s/%s", osvScannerVersion, assetName)
-
-	binaryName := "osv-scanner"
-	if runtime.GOOS == "windows" {
-		binaryName += ".exe"
-	}
-	targetPath := filepath.Join(dir, binaryName)
-	if isExecutableFile(targetPath) {
-		return targetPath, nil
-	}
-
-	log.Printf("downloading osv-scanner %s from %s", osvScannerVersion, url)
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download failed: %s", resp.Status)
-	}
-
-	tmpPath := targetPath + ".tmp"
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return "", err
-	}
-	_, err = io.Copy(out, resp.Body)
-	_ = out.Close()
-	if err != nil {
-		_ = os.Remove(tmpPath)
-		return "", err
-	}
-
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", err
-	}
-
-	if runtime.GOOS != "windows" {
-		_ = os.Chmod(targetPath, 0o755)
-	}
-
-	log.Printf("osv-scanner installed at %s", targetPath)
-	return targetPath, nil
-}
-
-func osvScannerAssetName() (string, error) {
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
-	switch goos {
-	case "windows":
-		switch goarch {
-		case "amd64":
-			return "osv-scanner_windows_amd64.exe", nil
-		case "arm64":
-			return "osv-scanner_windows_arm64.exe", nil
-		}
-	case "linux":
-		switch goarch {
-		case "amd64":
-			return "osv-scanner_linux_amd64", nil
-		case "arm64":
-			return "osv-scanner_linux_arm64", nil
-		}
-	case "darwin":
-		switch goarch {
-		case "amd64":
-			return "osv-scanner_darwin_amd64", nil
-		case "arm64":
-			return "osv-scanner_darwin_arm64", nil
-		}
-	}
-	return "", fmt.Errorf("unsupported platform %s/%s for osv-scanner auto-download", goos, goarch)
+	return "", false, nil
 }
 
 func isExecutableFile(path string) bool {
@@ -243,22 +146,7 @@ func isExecutableFile(path string) bool {
 	return !info.IsDir()
 }
 
-// findLocalOSVScanner looks for bin/osv-scanner relative to this package's
-// source directory, mirroring the Python engine/osv_bridge.py behaviour.
-func findLocalOSVScanner(binaryName string) string {
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		return ""
-	}
-	scannerDir := filepath.Dir(file)     // internal/scanner
-	repoRoot := filepath.Dir(scannerDir) // internal
-	repoRoot = filepath.Dir(repoRoot)    // zdll
-	localBin := filepath.Join(repoRoot, "bin", binaryName)
-	if isExecutableFile(localBin) {
-		return localBin
-	}
-	return ""
-}
+
 
 // ---------------------------------------------------------------------------
 // JSON models matching osv-scanner --format json output.

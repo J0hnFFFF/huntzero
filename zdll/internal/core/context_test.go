@@ -42,17 +42,10 @@ func TestBlackboardManager_FilterFindings(t *testing.T) {
 	bm := NewBlackboardManager("", nil, nil)
 	_ = bm.Init("test")
 
-	id1, _ := bm.AddFinding("H", "keep", "desc", "high", "evidence")
-	_, _ = bm.AddFinding("H", "drop", "desc", "low", "evidence")
-
-	f := bm.Snapshot().Findings
-	for i := range f {
-		if f[i].Title == "keep" {
-			f[i].Location = &Location{File: "/tmp/changed.go"}
-		} else {
-			f[i].Location = &Location{File: "/tmp/unchanged.go"}
-		}
-	}
+	id1, _ := bm.AddFinding("H", "keep", "desc", "high", "evidence",
+		WithLocation(&Location{File: "/tmp/changed.go"}))
+	_, _ = bm.AddFinding("H", "drop", "desc", "low", "evidence",
+		WithLocation(&Location{File: "/tmp/unchanged.go"}))
 
 	bm.FilterFindings(func(f *Finding) bool {
 		return f.Location != nil && f.Location.File == "/tmp/changed.go"

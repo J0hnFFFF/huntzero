@@ -15,15 +15,16 @@ type Renderer interface {
 
 // RenderData is the public report shape compatible with the Python reports.
 type RenderData struct {
-	Engine                   string            `json:"engine"`
-	Target                   string            `json:"target"`
-	Timestamp                string            `json:"timestamp"`
-	ElapsedSeconds           float64           `json:"elapsed_seconds"`
-	Summary                  map[string]any    `json:"summary"`
-	Findings                 []*core.Finding   `json:"findings"`
-	ZeroDayFindings          []*core.Finding   `json:"zero_day_findings"`
-	DependencyVulnerabilities []*core.Finding  `json:"dependency_vulnerabilities"`
-	Hypotheses               []*core.HypothesisNode `json:"hypotheses"`
+	Engine                    string                 `json:"engine"`
+	Target                    string                 `json:"target"`
+	ArtifactsDir              string                 `json:"artifacts_dir,omitempty"`
+	Timestamp                 string                 `json:"timestamp"`
+	ElapsedSeconds            float64                `json:"elapsed_seconds"`
+	Summary                   map[string]any         `json:"summary"`
+	Findings                  []*core.Finding        `json:"findings"`
+	ZeroDayFindings           []*core.Finding        `json:"zero_day_findings"`
+	DependencyVulnerabilities []*core.Finding        `json:"dependency_vulnerabilities"`
+	Hypotheses                []*core.HypothesisNode `json:"hypotheses"`
 }
 
 func BuildRenderData(bb *core.Blackboard, target string, elapsed time.Duration) *RenderData {
@@ -45,6 +46,7 @@ func BuildRenderData(bb *core.Blackboard, target string, elapsed time.Duration) 
 	return &RenderData{
 		Engine:                    bb.Engine,
 		Target:                    target,
+		ArtifactsDir:              bb.ArtifactsDir,
 		Timestamp:                 time.Now().Format(time.RFC3339),
 		ElapsedSeconds:            elapsed.Seconds(),
 		Summary:                   bb.SummaryPayload(),

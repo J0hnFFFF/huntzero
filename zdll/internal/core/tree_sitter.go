@@ -161,7 +161,15 @@ func (s *TreeSitterScanner) Scan(ctx context.Context) ([]*Finding, error) {
 			return nil
 		}
 
-		fileFindings := analyzeSource(ctx, path, lang, setup, data)
+		var fileFindings []*Finding
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "[tree-sitter] recovered from panic scanning %s: %v\n", path, r)
+				}
+			}()
+			fileFindings = analyzeSource(ctx, path, lang, setup, data)
+		}()
 		mu.Lock()
 		findings = append(findings, fileFindings...)
 		mu.Unlock()
@@ -193,9 +201,12 @@ func (s *TreeSitterScanner) Scan(ctx context.Context) ([]*Finding, error) {
 }
 
 func analyzeSource(ctx context.Context, path, lang string, setup *languageSetup, data []byte) []*Finding {
+	// Do not reuse parsers via a pool. go-tree-sitter's Go binding can return
+	// stale/corrupt node offsets when parsers are reused, causing slice bounds
+	// panics in Node.Content. Creating a parser per file is slower but safe.
 	parser := sitter.NewParser()
-	defer parser.Close()
 	parser.SetLanguage(setup.lang)
+	defer parser.Close()
 
 	parseCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -242,6 +253,11 @@ func analyzeCall(path, lang string, setup *languageSetup, n *sitter.Node, data [
 		funcNode = n.NamedChild(0)
 	}
 	if funcNode == nil {
+		return nil
+	}
+	// Guard against corrupt/stale node offsets (observed as slice bounds panic
+	// in go-tree-sitter Node.Content with reused parsers).
+	if funcNode.StartByte() > funcNode.EndByte() || int(funcNode.EndByte()) > len(data) {
 		return nil
 	}
 

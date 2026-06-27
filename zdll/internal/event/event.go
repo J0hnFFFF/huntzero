@@ -11,14 +11,15 @@ type Event struct {
 
 // Event type constants used by core and adapters.
 const (
-	CerebrumStarted             = "cerebrum_started"
-	CerebrumResumed             = "cerebrum_resumed"
-	CerebrumStopped             = "cerebrum_stopped"
-	CerebrumComplete            = "cerebrum_complete"
-	CerebrumRoundStarted        = "round_started"
-	CerebrumPaused              = "cerebrum_paused"
-	CerebrumError               = "cerebrum_error"
-	CerebrumCriticReviewed      = "cerebrum_critic_reviewed"
+	CerebrumStarted        = "cerebrum_started"
+	CerebrumResumed        = "cerebrum_resumed"
+	CerebrumStopped        = "cerebrum_stopped"
+	CerebrumComplete       = "cerebrum_complete"
+	CerebrumRoundStarted   = "round_started"
+	CerebrumPaused         = "cerebrum_paused"
+	CerebrumError          = "cerebrum_error"
+	CerebrumCriticReviewed = "cerebrum_critic_reviewed"
+	CerebrumThought        = "cerebrum_thought"
 
 	HypothesisGenerated = "hypothesis_generated"
 	HypothesisUpdated   = "hypothesis_updated"
@@ -31,17 +32,21 @@ const (
 	DroneFailed    = "drone_failed"
 	DroneTimeout   = "drone_timeout"
 
-	FindingConfirmed         = "finding_confirmed"
-	FindingRejectedByCritic  = "finding_rejected_by_critic"
+	FindingConfirmed        = "finding_confirmed"
+	FindingRejectedByCritic = "finding_rejected_by_critic"
+	FindingRetracted        = "finding_retracted"
 
-	SectorAnalysisStarted  = "sector_analysis_started"
+	SectorAnalysisStarted   = "sector_analysis_started"
 	SectorAnalysisCompleted = "sector_analysis_completed"
-	SectorAnalysisFailed   = "sector_analysis_failed"
+	SectorAnalysisFailed    = "sector_analysis_failed"
 
-	CoordinatorStarted    = "coordinator_started"
-	CoordinatorFinished   = "coordinator_finished"
-	CrossSectorStarted    = "cross_sector_started"
-	CrossSectorCompleted  = "cross_sector_completed"
+	CoordinatorStarted   = "coordinator_started"
+	CoordinatorFinished  = "coordinator_finished"
+	CrossSectorStarted   = "cross_sector_started"
+	CrossSectorCompleted = "cross_sector_completed"
+	CrossSectorFailed    = "cross_sector_failed"
+
+	PersistenceFailed = "persistence_failed"
 
 	Error = "error"
 )

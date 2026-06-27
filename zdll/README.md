@@ -30,9 +30,10 @@
 ## 快速开始
 
 ```bash
-# 设置 Kimi API Key
-export KIMI_API_KEY='sk-...'        # Linux/macOS
-$env:KIMI_API_KEY='sk-...'          # PowerShell
+# 设置 LLM API Key（Kimi / DeepSeek / OpenAI / Anthropic 均可）
+export ZDLL_LLM_API_KEY='sk-...'        # Linux/macOS
+$env:ZDLL_LLM_API_KEY='sk-...'          # PowerShell
+# 旧版兼容：KIMI_API_KEY 仍可被识别
 
 # 扫描本地项目
 zdll scan /path/to/project
@@ -55,7 +56,55 @@ zdll config validate
 zdll config get llm.model
 zdll config set analysis.workers 8
 zdll config unset llm.model
+```
 
+## 模型与 Provider 配置
+
+zdll 通过 Eino 同时支持 OpenAI-compatible 与 Anthropic Messages API 两种协议。
+
+### Kimi Code（默认，推荐）
+
+默认使用 Kimi Code 的 Anthropic Messages API endpoint，与 OpenClaw/Hermes/Claude Code 一致：
+
+```yaml
+llm:
+  provider: anthropic
+  api_key: sk-...
+  base_url: https://api.kimi.com/coding
+  model: kimi-for-coding
+```
+
+如果仍想使用 OpenAI-compatible endpoint（可能触发客户端白名单）：
+
+```yaml
+llm:
+  provider: openai
+  api_key: sk-...
+  base_url: https://api.kimi.com/coding/v1
+  model: kimi-for-coding
+```
+
+### DeepSeek / OpenAI / Anthropic
+
+```yaml
+llm:
+  provider: openai
+  api_key: sk-...
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-coder
+```
+
+```yaml
+llm:
+  provider: anthropic
+  api_key: sk-ant-...
+  base_url: https://api.anthropic.com/v1
+  model: claude-3-5-sonnet-20241022
+```
+
+Provider 会根据 `base_url` 自动推断；显式设置 `llm.provider` 可覆盖推断结果。
+
+```bash
 # 列出工作区
 zdll list
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -103,10 +104,6 @@ func (sm *SectorManager) decomposeWithLLM() ([]Sector, error) {
 		SkillsDir: sm.skillsDir,
 		Thinking:  true,
 	}
-	if agentFile, err := llm.BuildAgentYAML(sm.rootDir, "sector-planner", ""); err == nil {
-		cfg.AgentFile = agentFile
-	}
-
 	events, err := sm.runner.Run(ctx, cfg, prompt)
 	if err != nil {
 		return nil, err
@@ -314,11 +311,12 @@ func (sm *SectorManager) dirScale(root string) (files int, size int64, err error
 // Coordinator runs the engine over each sector and merges findings into the parent blackboard.
 type Coordinator struct {
 	engineFactory func(targetDir string) *Engine
+	runner        llm.AgentRunner
 	bus           eventbus.Bus
 }
 
-func NewCoordinator(factory func(targetDir string) *Engine, bus eventbus.Bus) *Coordinator {
-	return &Coordinator{engineFactory: factory, bus: bus}
+func NewCoordinator(factory func(targetDir string) *Engine, runner llm.AgentRunner, bus eventbus.Bus) *Coordinator {
+	return &Coordinator{engineFactory: factory, runner: runner, bus: bus}
 }
 
 // Run executes analysis across all sectors with bounded parallelism.
@@ -370,8 +368,15 @@ func (c *Coordinator) runSector(ctx context.Context, parent *BlackboardManager, 
 		return
 	}
 
-	// Bubble findings up to parent with sector_id.
-	for _, f := range child.Snapshot().Findings {
+	// Bubble only findings up to the parent. Sector-local hypotheses and tasks
+	// are intentionally isolated, matching Python's BlackboardPartition design.
+	// Findings carry a sector_id tag so cross-sector analysis can reason about
+	// their origin.
+	childSnap := child.Snapshot()
+	for _, f := range childSnap.Findings {
+		if f.Status == FindingStatusRejected {
+			continue
+		}
 		_, _ = parent.AddFinding(f.HypothesisID, f.Title, f.Description, f.Severity, f.Evidence, WithSectorID(sector.ID))
 	}
 
@@ -379,18 +384,109 @@ func (c *Coordinator) runSector(ctx context.Context, parent *BlackboardManager, 
 	sector.CompletedAt = float64(time.Now().UnixMilli()) / 1000.0
 	sector.FindingsCount = len(child.Snapshot().Findings)
 	c.publish(event.SectorAnalysisCompleted, map[string]any{
-		"sector_id":   sector.ID,
-		"findings":    sector.FindingsCount,
+		"sector_id": sector.ID,
+		"findings":  sector.FindingsCount,
 	})
 }
 
 func (c *Coordinator) crossSectorAnalysis(ctx context.Context, parent *BlackboardManager, sectors []Sector) {
-	if len(parent.Snapshot().Findings) < 2 {
+	findings := parent.Snapshot().Findings
+	if len(findings) < 2 {
 		return
 	}
-	// Placeholder for LLM-driven cross-sector exploit chain analysis.
-	// The parent blackboard already contains all sector findings, so a future
-	// implementation can prompt an LLM to identify multi-stage attack chains.
+
+	c.publish(event.CrossSectorStarted, map[string]any{"findings_count": len(findings)})
+
+	var summaries []string
+	for _, f := range findings {
+		sectorID := "unknown"
+		if f.SectorID != nil {
+			sectorID = *f.SectorID
+		}
+		summaries = append(summaries, fmt.Sprintf(
+			"- [%s] (sector: %s) %s: %s",
+			strings.ToUpper(f.Severity),
+			sectorID,
+			f.Title,
+			truncateString(f.Description, 200),
+		))
+	}
+
+	prompt := fmt.Sprintf(
+		"You are a CROSS-MODULE SECURITY ANALYST.\n\n"+
+			"The following %d vulnerabilities were found in SEPARATE modules of a large project:\n\n"+
+			"%s\n\n"+
+			"Your task:\n"+
+			"1. Identify any EXPLOIT CHAINS that combine findings from different modules.\n"+
+			"   Example: SSRF in Module A + unauthenticated admin API in Module B = SSRF→Admin Takeover.\n"+
+			"2. For each chain, describe the full attack path and impact.\n"+
+			"3. If no cross-module chains exist, state so clearly.\n\n"+
+			"Output format (one block per chain):\n"+
+			"CHAIN: <chain name>\n"+
+			"PATH: <step1 (sector A finding) → step2 (sector B finding) → impact>\n"+
+			"SEVERITY: <critical|high|medium>\n"+
+			"DESCRIPTION: <full attack narrative>\n",
+		len(findings),
+		strings.Join(summaries, "\n"),
+	)
+
+	cfg := llm.AgentConfig{
+		Role:      "cross-sector-analyst",
+		WorkDir:   parent.WorkDir(),
+		Thinking:  true,
+	}
+
+	text, err := c.runAgentText(ctx, cfg, prompt)
+	if err != nil {
+		c.publish(event.CrossSectorFailed, map[string]any{"error": err.Error()})
+		return
+	}
+
+	chainRe := regexp.MustCompile(`(?is)CHAIN:\s*(.+?)\n.*?SEVERITY:\s*(\w+).*?DESCRIPTION:\s*(.+?)(?=\nCHAIN:|$)`)
+	matches := chainRe.FindAllStringSubmatch(text, -1)
+	chainsFound := 0
+	for _, m := range matches {
+		if len(m) != 4 {
+			continue
+		}
+		name := strings.TrimSpace(m[1])
+		severity := strings.ToLower(strings.TrimSpace(m[2]))
+		description := strings.TrimSpace(m[3])
+		if name == "" || description == "" {
+			continue
+		}
+		_, _ = parent.AddFinding(
+			"cross-sector",
+			fmt.Sprintf("[Cross-Module] %s", name),
+			description,
+			severity,
+			fmt.Sprintf("Combined from %d sector findings", len(findings)),
+			WithSectorID("cross-sector"),
+		)
+		chainsFound++
+	}
+
+	c.publish(event.CrossSectorCompleted, map[string]any{"chains_found": chainsFound})
+}
+
+func (c *Coordinator) runAgentText(ctx context.Context, cfg llm.AgentConfig, prompt string) (string, error) {
+	if c.runner == nil {
+		return "", fmt.Errorf("no runner available for cross-sector analysis")
+	}
+	events, err := c.runner.Run(ctx, cfg, prompt)
+	if err != nil {
+		return "", err
+	}
+	var text string
+	for ev := range events {
+		if ev.Type == "text" {
+			text += ev.Content
+		}
+		if ev.Type == "error" {
+			return text, fmt.Errorf("agent error: %s", ev.Content)
+		}
+	}
+	return text, nil
 }
 
 func (c *Coordinator) publish(typ string, data map[string]any) {

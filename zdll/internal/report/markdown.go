@@ -3,6 +3,7 @@ package report
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,6 +25,9 @@ func (r *MarkdownRenderer) Render(bb *core.Blackboard, target string, elapsed ti
 	fmt.Fprintf(&b, "| Field | Value |\n|-------|-------|\n")
 	fmt.Fprintf(&b, "| Engine | %s |\n", data.Engine)
 	fmt.Fprintf(&b, "| Target | `%s` |\n", data.Target)
+	if data.ArtifactsDir != "" {
+		fmt.Fprintf(&b, "| Artifacts | `%s` |\n", data.ArtifactsDir)
+	}
 	fmt.Fprintf(&b, "| Timestamp | %s |\n", data.Timestamp)
 	fmt.Fprintf(&b, "| Duration | %.1fs |\n\n", data.ElapsedSeconds)
 
@@ -43,7 +47,7 @@ func (r *MarkdownRenderer) Render(bb *core.Blackboard, target string, elapsed ti
 			fmt.Fprintf(&b, "- **Hypothesis**: %s\n", f.HypothesisID)
 			fmt.Fprintf(&b, "- **ID**: %s\n\n", f.ID)
 			fmt.Fprintf(&b, "**Description:**\n\n%s\n\n", f.Description)
-			fmt.Fprintf(&b, "**Evidence:**\n\n```\n%s\n```\n\n", f.Evidence)
+			fmt.Fprintf(&b, "**Evidence:**\n\n```\n%s\n```\n\n", sanitizeMarkdownFences(f.Evidence))
 		}
 	}
 
@@ -63,6 +67,17 @@ func (r *MarkdownRenderer) Render(bb *core.Blackboard, target string, elapsed ti
 	}
 
 	return b.Bytes(), nil
+}
+
+var fenceRe = regexp.MustCompile("`{3,}")
+
+// sanitizeMarkdownFences replaces runs of three or more backticks with the
+// same number of tildes so that evidence containing nested code fences does
+// not break the report's outer code block.
+func sanitizeMarkdownFences(s string) string {
+	return fenceRe.ReplaceAllStringFunc(s, func(m string) string {
+		return strings.Repeat("~", len(m))
+	})
 }
 
 func severityEmoji(severity string) string {

@@ -14,12 +14,15 @@ type Scanner interface {
 }
 
 // All returns every scanner that is available for the given configuration.
-// The semantic scanner is always included. The OSV scanner is included when a
-// local binary exists or can be auto-downloaded.
+// The semantic scanner is always included. The OSV scanner is always created;
+// if no binary path is known at configuration time it will be re-discovered
+// against the target directory's bin/ and PATH when Scan is called.
 func All(cfg *config.Config) []Scanner {
 	scanners := []Scanner{NewSemanticScanner()}
-	if path, ok, _ := resolveOrInstallOSVScanner(cfg); ok {
-		scanners = append(scanners, NewOSVScanner(path))
+	osv := NewOSVScanner("")
+	if path, ok, _ := resolveOSVScanner(cfg); ok {
+		osv.Path = path
 	}
+	scanners = append(scanners, osv)
 	return scanners
 }

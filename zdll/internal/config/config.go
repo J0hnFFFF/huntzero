@@ -48,9 +48,11 @@ func Default() *Config {
 	home, _ := os.UserHomeDir()
 	return &Config{
 		LLM: LLMConfig{
-			Provider: "kimi",
-			BaseURL:  "https://api.kimi.com/coding/v1",
-			Model:    "kimi-for-coding",
+			// Use Kimi Code's Anthropic Messages API endpoint by default.
+			// This is the endpoint used by OpenClaw, Hermes, and Claude Code.
+			Provider: "anthropic",
+			BaseURL:  "https://api.kimi.com/coding",
+			Model:    "kimi-code/kimi-for-coding",
 			Thinking: true,
 		},
 		Analysis: AnalysisConfig{
@@ -110,15 +112,14 @@ func Load(configFile string) (*Config, error) {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
 
-	// Override with explicit env vars for secrets.
-	if apiKey := os.Getenv("KIMI_API_KEY"); apiKey != "" {
-		cfg.LLM.APIKey = apiKey
-	}
-	if baseURL := os.Getenv("KIMI_BASE_URL"); baseURL != "" {
-		cfg.LLM.BaseURL = baseURL
-	}
-	if model := os.Getenv("KIMI_MODEL_NAME"); model != "" {
-		cfg.LLM.Model = model
+	// KIMI_API_KEY is a convenience fallback for users who keep provider-named
+	// API key env vars. ZDLL_LLM_API_KEY (handled by Viper above) takes
+	// precedence. KIMI_BASE_URL / KIMI_MODEL_NAME are intentionally not honored;
+	// use ZDLL_LLM_BASE_URL / ZDLL_LLM_MODEL_NAME or the config file instead.
+	if cfg.LLM.APIKey == "" {
+		if apiKey := os.Getenv("KIMI_API_KEY"); apiKey != "" {
+			cfg.LLM.APIKey = apiKey
+		}
 	}
 
 	// Resolve relative paths.
@@ -155,6 +156,15 @@ func Save(cfg *Config, path string) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
+// MaskSecret returns a redacted representation of a secret suitable for UI
+// output. It never reveals any characters of the secret, regardless of length.
+func MaskSecret(secret string) string {
+	if secret == "" {
+		return "(not set)"
+	}
+	return "********"
+}
+
 // InitConfigDir creates the configuration directory and a sample file.
 func InitConfigDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -169,9 +179,9 @@ func InitConfigDir() (string, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		sample := `# zdll configuration
 llm:
-  provider: kimi
-  # api_key: sk-...                    # or set KIMI_API_KEY env var
-  base_url: https://api.kimi.com/coding/v1
+  provider: anthropic                  # anthropic = Kimi Code Anthropic endpoint; openai = /coding/v1
+  # api_key: sk-...                    # or set ZDLL_LLM_API_KEY / KIMI_API_KEY env var
+  base_url: https://api.kimi.com/coding
   model: kimi-for-coding
   thinking: true
 

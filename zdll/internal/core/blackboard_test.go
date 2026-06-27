@@ -88,7 +88,7 @@ func TestBlackboardManager_Persistence(t *testing.T) {
 	bm := NewBlackboardManager(workDir, s, bus)
 	_ = bm.Init("./testdata")
 	hid, _ := bm.AddHypothesis("Race condition in auth", 0.6, nil)
-	_ = bm.SetRound(3)
+	bm.SetRound(3)
 
 	// Re-load with a new manager.
 	bm2 := NewBlackboardManager(workDir, s, bus)
@@ -109,5 +109,37 @@ func TestWorkspaceJSON_LoadMissing(t *testing.T) {
 	_, err := s.Load(filepath.Join(dir, "missing"))
 	if !os.IsNotExist(err) {
 		t.Fatalf("expected not exist, got %v", err)
+	}
+}
+
+func TestSortedFindings_DeduplicatesSimilarFindings(t *testing.T) {
+	dir := t.TempDir()
+	bus := eventbus.NewLocal()
+	s := NewJSONStore(dir)
+	bm := NewBlackboardManager(filepath.Join(dir, "ws"), s, bus)
+	_ = bm.Init("https://github.com/test/repo")
+
+	_, _ = bm.AddFinding("H1",
+		"Credential redaction fails on multi-line PEM keys",
+		"The regex in secret-patterns.ts does not match secrets spanning multiple lines in log output.",
+		"high",
+		"Evidence A")
+	_, _ = bm.AddFinding("H2",
+		"Credential redaction fails on base64 encoded secrets",
+		"The regex in secret-patterns.ts does not match secrets encoded as base64 in log output.",
+		"medium",
+		"Evidence B")
+	_, _ = bm.AddFinding("H3",
+		"Unrelated XSS in search box",
+		"User input is reflected without encoding in search results.",
+		"critical",
+		"Evidence C")
+
+	findings := bm.Snapshot().SortedFindings()
+	if len(findings) != 2 {
+		t.Fatalf("expected 2 deduplicated findings, got %d", len(findings))
+	}
+	if findings[0].Severity != SeverityCritical {
+		t.Fatalf("expected critical finding first, got %s", findings[0].Severity)
 	}
 }

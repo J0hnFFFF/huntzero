@@ -28,14 +28,14 @@ type FileSummary struct {
 
 // DocIntelReport is the gathered context for a target.
 type DocIntelReport struct {
-	TotalFiles      int             `json:"total_files"`
-	TotalBytes      int64           `json:"total_bytes"`
-	Languages       map[string]int  `json:"languages"`
-	TopFiles        []FileSummary   `json:"top_files"`
-	DependencyFiles []string        `json:"dependency_files"`
-	Entrypoints     []string        `json:"entrypoints"`
-	Tree            string          `json:"tree"`
-	Findings        []*Finding      `json:"findings,omitempty"`
+	TotalFiles      int            `json:"total_files"`
+	TotalBytes      int64          `json:"total_bytes"`
+	Languages       map[string]int `json:"languages"`
+	TopFiles        []FileSummary  `json:"top_files"`
+	DependencyFiles []string       `json:"dependency_files"`
+	Entrypoints     []string       `json:"entrypoints"`
+	Tree            string         `json:"tree"`
+	Findings        []*Finding     `json:"findings,omitempty"`
 }
 
 // NewDocIntel creates a default DocIntel for the given target directory.
@@ -48,6 +48,7 @@ func NewDocIntel(targetDir string) *DocIntel {
 			".git": {}, "node_modules": {}, "vendor": {}, "__pycache__": {},
 			".venv": {}, "venv": {}, "tmp": {}, ".workbuddy": {}, "dist": {},
 			"build": {}, ".idea": {}, ".vscode": {}, ".benchmarks": {},
+			".github": {}, ".circleci": {}, ".gitlab": {},
 		},
 	}
 }

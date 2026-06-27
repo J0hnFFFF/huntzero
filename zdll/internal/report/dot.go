@@ -28,7 +28,7 @@ func (r *DOTRenderer) Render(bb *core.Blackboard, target string, elapsed time.Du
 	}
 
 	b.WriteString("\n")
-	for _, f := range bb.Findings {
+	for _, f := range bb.SortedFindings() {
 		color := severityColor(f.Severity)
 		fmt.Fprintf(&b, "  \"%s\" [label=\"%s\\n%s\", shape=doublecircle, color=\"%s\"];\n", f.ID, f.ID, truncate(f.Title, 40), color)
 		if f.HypothesisID != "" {

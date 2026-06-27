@@ -3,30 +3,41 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"zdll/internal/config"
 	"zdll/internal/core"
 	"zdll/internal/event"
 	"zdll/internal/eventbus"
+	"zdll/internal/exploit"
 	"zdll/internal/llm"
 	"zdll/internal/report"
 	"zdll/internal/scanner"
+
+	"github.com/cloudwego/eino/components/model"
 )
 
 // App is the application service used by CLI.
 type App struct {
-	cfg      *config.Config
-	bus      eventbus.Bus
-	store    core.Store
-	runner   llm.AgentRunner
-	managers map[string]*core.BlackboardManager
+	cfg             *config.Config
+	bus             eventbus.Bus
+	store           core.Store
+	runner          llm.AgentRunner
+	droneRunner     llm.AgentRunner
+	exploitAnalyzer *exploit.Analyzer
+	llmModel        model.BaseChatModel
+	managers        map[string]*core.BlackboardManager
 	// scanners optionally overrides the scanners used by the engine. When nil,
 	// scanner.All(cfg) is used.
 	scanners []core.Scanner
+	// wg tracks background goroutines started by Scan.
+	wg sync.WaitGroup
 }
 
 // ScanOptions controls optional scan behaviour.
@@ -75,6 +86,27 @@ func New(cfg *config.Config, bus eventbus.Bus, s core.Store, runner llm.AgentRun
 	}
 }
 
+// WithDroneRunner sets a dedicated runner for Drone tasks. When unset, the
+// Cerebrum runner is reused.
+func (a *App) WithDroneRunner(r llm.AgentRunner) *App {
+	a.droneRunner = r
+	return a
+}
+
+// WithExploitAnalyzer sets a custom exploit analyzer. When unset, a default
+// static-only analyzer is used.
+func (a *App) WithExploitAnalyzer(analyzer *exploit.Analyzer) *App {
+	a.exploitAnalyzer = analyzer
+	return a
+}
+
+// WithLLMModel stores the base chat model so that optional LLM-backed
+// subsystems (e.g. the exploit analyzer) can reuse it.
+func (a *App) WithLLMModel(m model.BaseChatModel) *App {
+	a.llmModel = m
+	return a
+}
+
 // Scan starts a new analysis.
 func (a *App) Scan(ctx context.Context, target string, resume bool, opts ...ScanOption) (*core.BlackboardManager, error) {
 	options := &ScanOptions{}
@@ -116,23 +148,40 @@ func (a *App) Scan(ctx context.Context, target string, resume bool, opts ...Scan
 		}
 	}
 	engineCfg := &core.EngineConfig{
-		Workers:     a.cfg.Analysis.Workers,
-		MaxRounds:   a.cfg.Analysis.MaxRounds,
-		MaxTasks:    a.cfg.Analysis.MaxTasks,
-		MaxTime:     time.Duration(a.cfg.Analysis.MaxTime) * time.Second,
-		Stagnation:  a.cfg.Analysis.Stagnation,
-		AutoApprove: a.cfg.Analysis.AutoApprove,
-		Model:       a.cfg.LLM.Model,
-		APIKey:      a.cfg.LLM.APIKey,
-		BaseURL:     a.cfg.LLM.BaseURL,
-		Scanners:    coreScanners,
+		Workers:      a.cfg.Analysis.Workers,
+		MaxRounds:    a.cfg.Analysis.MaxRounds,
+		MaxTasks:     a.cfg.Analysis.MaxTasks,
+		MaxTime:      time.Duration(a.cfg.Analysis.MaxTime) * time.Second,
+		Stagnation:   a.cfg.Analysis.Stagnation,
+		AutoApprove:  a.cfg.Analysis.AutoApprove,
+		Model:        a.cfg.LLM.Model,
+		APIKey:       a.cfg.LLM.APIKey,
+		BaseURL:      a.cfg.LLM.BaseURL,
+		Scanners:     coreScanners,
+		ArtifactsDir: filepath.Join(workDir, "artifacts"),
 	}
 	engine := core.NewEngine(engineCfg, a.runner, a.cfg.Paths.Skills, filepath.Dir(a.cfg.Paths.Skills), targetDir, a.bus)
+	if a.droneRunner != nil {
+		engine.WithDroneRunner(a.droneRunner)
+	}
+	if a.exploitAnalyzer != nil {
+		engine.WithExploitAnalyzer(a.exploitAnalyzer)
+	} else {
+		engine.WithExploitAnalyzer(exploit.NewAnalyzer())
+	}
+	critic := core.NewCritic(a.runner, filepath.Dir(a.cfg.Paths.Skills), a.cfg.Paths.Skills, a.bus)
+	engine.WithCritic(critic)
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done()
 		start := time.Now()
 		defer func() {
 			if r := recover(); r != nil {
-				a.publish(event.Error, map[string]any{"message": fmt.Sprintf("engine panic: %v", r)})
+				stack := debug.Stack()
+				msg := fmt.Sprintf("engine panic: %v\n%s", r, string(stack))
+				// Publish to event bus and also write to stderr so it survives the CLI loop.
+				a.publish(event.Error, map[string]any{"message": msg})
+				fmt.Fprintln(os.Stderr, msg)
 			}
 		}()
 		if len(options.ChangedPaths) > 0 {
@@ -151,7 +200,7 @@ func (a *App) Scan(ctx context.Context, target string, resume bool, opts ...Scan
 		if options.Output != "" {
 			a.exportReportTo(options.Output, target, elapsed, options.Format)
 		}
-		_ = bm.SetActive(false)
+		bm.SetActive(false)
 		stats := bm.Stats()
 		statsAny := make(map[string]any, len(stats))
 		for k, v := range stats {
@@ -172,6 +221,13 @@ func (a *App) Resume(ctx context.Context, target string, opts ...ScanOption) (*c
 func (a *App) Stop(target string) error {
 	// Context cancellation is handled by the caller; this is a placeholder.
 	return nil
+}
+
+// Wait blocks until all background scans started by Scan have completed.
+// Callers should cancel the context passed to Scan before calling Wait to
+// ensure scans finish promptly.
+func (a *App) Wait() {
+	a.wg.Wait()
 }
 
 // Findings returns the current findings for a target.
@@ -213,16 +269,23 @@ func (a *App) exportReports(workDir, target string, elapsed time.Duration) {
 		&report.GraphMLRenderer{},
 	}
 	base := core.SanitizeFilename(filepath.Base(target))
+	reportsDir := filepath.Join(workDir, "reports")
 	for _, r := range renderers {
 		data, err := r.Render(a.managers[target].Snapshot(), target, elapsed)
 		if err != nil {
-			a.publish(event.Error, map[string]any{"message": fmt.Sprintf("render %s: %v", r.Name(), err)})
+			msg := fmt.Sprintf("render %s report: %v", r.Name(), err)
+			log.Printf("[report] %s", msg)
+			a.publish(event.Error, map[string]any{"message": msg})
 			continue
 		}
 		name := core.TimestampedReportName(base, r.Extension())
 		if err := core.WriteReport(workDir, name, data); err != nil {
-			a.publish(event.Error, map[string]any{"message": fmt.Sprintf("write %s: %v", name, err)})
+			msg := fmt.Sprintf("write %s report: %v", name, err)
+			log.Printf("[report] %s", msg)
+			a.publish(event.Error, map[string]any{"message": msg})
+			continue
 		}
+		log.Printf("[report] wrote %s", filepath.Join(reportsDir, name))
 	}
 }
 

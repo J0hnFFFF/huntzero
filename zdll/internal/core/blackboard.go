@@ -2,8 +2,10 @@ package core
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,7 +38,10 @@ func (bm *BlackboardManager) Init(target string) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
-	if bm.store != nil {
+	// Resume only when target is empty (the caller's convention for resume).
+	// New scans must start from a fresh blackboard even if a persisted workspace
+	// already exists, otherwise round/task budgets and hypotheses leak across runs.
+	if bm.store != nil && target == "" {
 		loaded, err := bm.store.Load(bm.workDir)
 		if err == nil && loaded != nil {
 			bm.bb = loaded
@@ -53,10 +58,9 @@ func (bm *BlackboardManager) Init(target string) error {
 	}
 
 	bm.bb = NewBlackboard(target)
-	if err := bm.persistLocked(); err != nil {
-		return err
-	}
-	bm.publish(event.CerebrumStarted, map[string]any{"target": target})
+	bm.persistLocked()
+	// CerebrumStarted is published by Engine.Run so that resume and new scans
+	// emit it at the same lifecycle point.
 	return nil
 }
 
@@ -80,30 +84,28 @@ func (bm *BlackboardManager) AddHypothesis(description string, confidence float6
 		return "", fmt.Errorf("negative polarity hypothesis rejected")
 	}
 
-	// Bloom pre-filter: if definitely not seen, it's new.
-	if bm.bloom.MightContain(description) {
-		if dupID, score := findSimilarHypothesis(bm.bb, description, 0.55); dupID != "" && score >= 0.55 {
-			h := bm.bb.Hypotheses[dupID]
-			// Merge confidence with small boost.
-			h.Confidence = minFloat(1.0, maxFloat(h.Confidence, confidence)+0.02)
-			if h.Status == HypothesisDiscarded && h.Confidence >= 0.4 {
-				h.Status = HypothesisPending
-			}
-			h.Evidence = append(h.Evidence, fmt.Sprintf("[merged] similar hypothesis merged (score=%.2f)", score))
-			bm.bb.touch()
-			bm.persistLocked()
-			bm.publish(event.HypothesisUpdated, hypothesisPayload(h))
-			return dupID, nil
+	// Semantic deduplication: always check against existing hypotheses. Paraphrased
+	// descriptions can bypass a Bloom pre-filter, so we run the full similarity
+	// pipeline on every new hypothesis.
+	if dupID, score := findSimilarHypothesis(bm.bb, description, 0.55); dupID != "" && score >= 0.55 {
+		h := bm.bb.Hypotheses[dupID]
+		// Merge confidence with small boost.
+		h.Confidence = minFloat(1.0, maxFloat(h.Confidence, confidence)+0.02)
+		if h.Status == HypothesisDiscarded && h.Confidence >= 0.4 {
+			h.Status = HypothesisPending
 		}
+		h.Evidence = append(h.Evidence, fmt.Sprintf("[merged] similar hypothesis merged (score=%.2f)", score))
+		bm.bb.touch()
+		bm.persistLocked()
+		bm.publish(event.HypothesisUpdated, hypothesisPayload(h))
+		return dupID, nil
 	}
 
 	h := NewHypothesisNode(description, confidence, parentID)
 	bm.bb.Hypotheses[h.ID] = h
 	bm.bloom.Add(description)
 	bm.bb.touch()
-	if err := bm.persistLocked(); err != nil {
-		return "", err
-	}
+	bm.persistLocked()
 	bm.publish(event.HypothesisGenerated, hypothesisPayload(h))
 	return h.ID, nil
 }
@@ -116,26 +118,35 @@ func (bm *BlackboardManager) UpdateHypothesis(id string, updates map[string]any)
 	if !ok {
 		return fmt.Errorf("hypothesis %s not found", id)
 	}
+	changed := false
 	for k, v := range updates {
 		switch k {
 		case "confidence":
 			if f, ok := v.(float64); ok {
-				h.Confidence = f
+				if absFloat(h.Confidence-f) >= 0.001 {
+					h.Confidence = f
+					changed = true
+				}
 			}
 		case "status":
 			if s, ok := v.(string); ok {
-				h.Status = HypothesisStatus(s)
+				if h.Status != HypothesisStatus(s) {
+					h.Status = HypothesisStatus(s)
+					changed = true
+				}
 			}
 		case "evidence":
 			if s, ok := v.(string); ok {
 				h.Evidence = append(h.Evidence, s)
+				changed = true
 			}
 		}
 	}
-	bm.bb.touch()
-	if err := bm.persistLocked(); err != nil {
-		return err
+	if !changed {
+		return nil
 	}
+	bm.bb.touch()
+	bm.persistLocked()
 	bm.publish(event.HypothesisUpdated, hypothesisPayload(h))
 	return nil
 }
@@ -168,9 +179,7 @@ func (bm *BlackboardManager) AddTask(hypothesisID, description, droneRole string
 	}
 	bm.bb.TotalTasks++
 	bm.bb.touch()
-	if err := bm.persistLocked(); err != nil {
-		return "", err
-	}
+	bm.persistLocked()
 	bm.publish(event.TaskQueued, taskPayload(t))
 	return t.ID, nil
 }
@@ -195,10 +204,25 @@ func (bm *BlackboardManager) UpdateTask(id string, status TaskStatus, result, er
 		t.CompletedAt = &now
 	}
 	bm.bb.touch()
-	if err := bm.persistLocked(); err != nil {
-		return err
-	}
+	bm.persistLocked()
 	bm.publish(event.TaskUpdated, taskPayload(t))
+	return nil
+}
+
+// MarkTaskIntegrated marks a task as having been processed by the result
+// integrator. This prevents the same Drone output from being double-counted
+// across multiple integration passes.
+func (bm *BlackboardManager) MarkTaskIntegrated(id string) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	t, ok := bm.bb.Tasks[id]
+	if !ok {
+		return fmt.Errorf("task %s not found", id)
+	}
+	t.Integrated = true
+	bm.bb.touch()
+	bm.persistLocked()
 	return nil
 }
 
@@ -229,27 +253,122 @@ func (bm *BlackboardManager) AddFinding(hypothesisID, title, description, severi
 		h.Evidence = append(h.Evidence, fmt.Sprintf("[confirmed] finding %s", newFinding.ID))
 	}
 	bm.bb.touch()
-	if err := bm.persistLocked(); err != nil {
-		return "", err
-	}
+	bm.persistLocked()
 	bm.publish(event.FindingConfirmed, findingPayload(newFinding))
+	bm.writeAuditNotesLocked()
 	return newFinding.ID, nil
 }
 
-func (bm *BlackboardManager) SetRound(round int) error {
+// RejectFinding marks a finding as rejected and records the reason. Rejected
+// findings are excluded from reports and summary statistics by default.
+func (bm *BlackboardManager) RejectFinding(id, reason string) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	for _, f := range bm.bb.Findings {
+		if f.ID == id {
+			f.Status = FindingStatusRejected
+			f.RejectedReason = reason
+			f.Severity = SeverityNone
+			bm.bb.touch()
+			bm.persistLocked()
+			bm.publish(event.FindingRejectedByCritic, map[string]any{
+				"finding_id": id,
+				"reason":     reason,
+			})
+			return nil
+		}
+	}
+	return fmt.Errorf("finding %s not found", id)
+}
+
+// GetFinding returns a finding by ID, or nil if not found.
+func (bm *BlackboardManager) GetFinding(id string) *Finding {
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	for _, f := range bm.bb.Findings {
+		if f.ID == id {
+			return f
+		}
+	}
+	return nil
+}
+
+// SetFindingPrerequisites updates the exploit prerequisites of an existing
+// finding. This is used by the exploit analyzer after a finding is created.
+func (bm *BlackboardManager) SetFindingPrerequisites(id string, prereqs *ExploitPrerequisites) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	for _, f := range bm.bb.Findings {
+		if f.ID == id {
+			f.Prerequisites = prereqs
+			bm.bb.touch()
+			bm.persistLocked()
+			return nil
+		}
+	}
+	return fmt.Errorf("finding %s not found", id)
+}
+
+// WriteAuditNotes writes the current findings to a markdown audit notes file.
+func (bm *BlackboardManager) WriteAuditNotes() {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	bm.writeAuditNotesLocked()
+}
+
+func (bm *BlackboardManager) writeAuditNotesLocked() {
+	path := filepath.Join(bm.workDir, ".audit_notes.md")
+	_ = os.WriteFile(path, []byte(formatAuditNotes(bm.bb)), 0o644)
+}
+
+func formatAuditNotes(bb *Blackboard) string {
+	var b strings.Builder
+	b.WriteString("# HIVE-MIND CONFIRMED FINDINGS\n\n")
+	if len(bb.Findings) == 0 {
+		b.WriteString("_No findings confirmed yet._\n")
+		return b.String()
+	}
+	for _, f := range bb.SortedFindings() {
+		fmt.Fprintf(&b, "### [LEAD: CONFIRMED] %s %s\n", strings.ToUpper(f.Severity), f.Title)
+		fmt.Fprintf(&b, "- **Severity**: %s\n", strings.ToUpper(f.Severity))
+		fmt.Fprintf(&b, "- **Description**: %s\n", f.Description)
+		fmt.Fprintf(&b, "- **Evidence**: %s\n\n", f.Evidence)
+	}
+	return b.String()
+}
+
+func (bm *BlackboardManager) SetRound(round int) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 	bm.bb.Round = round
 	bm.bb.touch()
-	return bm.persistLocked()
+	bm.persistLocked()
 }
 
-func (bm *BlackboardManager) SetActive(active bool) error {
+func (bm *BlackboardManager) SetTarget(target string) {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	bm.bb.Target = target
+	bm.bb.touch()
+	bm.persistLocked()
+}
+
+func (bm *BlackboardManager) SetActive(active bool) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 	bm.bb.Active = active
 	bm.bb.touch()
-	return bm.persistLocked()
+	bm.persistLocked()
+}
+
+func (bm *BlackboardManager) SetArtifactsDir(dir string) {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	bm.bb.ArtifactsDir = dir
+	bm.bb.touch()
+	bm.persistLocked()
 }
 
 func (bm *BlackboardManager) Stats() map[string]int {
@@ -261,14 +380,16 @@ func (bm *BlackboardManager) Stats() map[string]int {
 func (bm *BlackboardManager) Snapshot() *Blackboard {
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
-	return bm.bb
+	return bm.bb.Clone()
 }
 
-func (bm *BlackboardManager) persistLocked() error {
+func (bm *BlackboardManager) persistLocked() {
 	if bm.store == nil {
-		return nil
+		return
 	}
-	return bm.store.Save(bm.workDir, bm.bb)
+	if err := bm.store.Save(bm.workDir, bm.bb); err != nil {
+		bm.publish(event.PersistenceFailed, map[string]any{"error": err.Error()})
+	}
 }
 
 func (bm *BlackboardManager) publish(typ string, data map[string]any) {
@@ -345,6 +466,50 @@ func WithLocation(loc *Location) FindingOption {
 }
 
 // FilterFindings removes findings that do not satisfy keep.
+// ActiveFindings returns non-rejected findings.
+func (bb *Blackboard) ActiveFindings() []*Finding {
+	out := make([]*Finding, 0, len(bb.Findings))
+	for _, f := range bb.Findings {
+		if f.Status != FindingStatusRejected {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// MergeFrom merges hypotheses and tasks from a child blackboard into this
+// manager. This is used by the sector coordinator to bubble up sector-local
+// hypotheses and tasks without going through the deduplication path, so that
+// original IDs and task→hypothesis bindings are preserved.
+func (bm *BlackboardManager) MergeFrom(child *Blackboard) {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	for id, h := range child.Hypotheses {
+		if existing, ok := bm.bb.Hypotheses[id]; ok {
+			if h.Confidence > existing.Confidence {
+				existing.Confidence = h.Confidence
+			}
+			if SeverityRank(string(h.Status)) > SeverityRank(string(existing.Status)) {
+				existing.Status = h.Status
+			}
+			existing.Evidence = append(existing.Evidence, h.Evidence...)
+		} else {
+			bm.bb.Hypotheses[id] = h.Clone()
+			bm.bloom.Add(h.Description)
+		}
+	}
+
+	for id, t := range child.Tasks {
+		if _, ok := bm.bb.Tasks[id]; !ok {
+			bm.bb.Tasks[id] = t.Clone()
+		}
+	}
+
+	bm.bb.touch()
+	bm.persistLocked()
+}
+
 func (bm *BlackboardManager) FilterFindings(keep func(*Finding) bool) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
@@ -357,14 +522,16 @@ func (bm *BlackboardManager) FilterFindings(keep func(*Finding) bool) {
 	}
 	bm.bb.Findings = kept
 	bm.bb.touch()
-	_ = bm.persistLocked()
+	bm.persistLocked()
 }
 
 // Report helpers.
 
 func (bb *Blackboard) SortedFindings() []*Finding {
-	out := make([]*Finding, len(bb.Findings))
-	copy(out, bb.Findings)
+	active := bb.ActiveFindings()
+	active = DeduplicateFindings(active)
+	out := make([]*Finding, len(active))
+	copy(out, active)
 	sort.Slice(out, func(i, j int) bool {
 		return SeverityRank(out[i].Severity) > SeverityRank(out[j].Severity)
 	})

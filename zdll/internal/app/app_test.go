@@ -19,19 +19,11 @@ func TestFilterFindingsByPaths(t *testing.T) {
 	bm := core.NewBlackboardManager("", nil, nil)
 	_ = bm.Init("test")
 
-	id1, _ := bm.AddFinding("H1", "changed file", "desc", "high", "evidence")
-	id2, _ := bm.AddFinding("H2", "unchanged file", "desc", "low", "evidence")
+	id1, _ := bm.AddFinding("H1", "changed file", "desc", "high", "evidence",
+		core.WithLocation(&core.Location{File: "/repo/src/changed.go"}))
+	id2, _ := bm.AddFinding("H2", "unchanged file", "desc", "low", "evidence",
+		core.WithLocation(&core.Location{File: "/repo/src/unchanged.go"}))
 	id3, _ := bm.AddFinding("H3", "evidence match", "desc", "medium", "src/changed.go:42 unsafe")
-
-	findings := bm.Snapshot().Findings
-	for _, f := range findings {
-		switch f.Title {
-		case "changed file":
-			f.Location = &core.Location{File: "/repo/src/changed.go"}
-		case "unchanged file":
-			f.Location = &core.Location{File: "/repo/src/unchanged.go"}
-		}
-	}
 
 	a := &App{}
 	a.filterFindingsByPaths(bm, []string{"/repo/src/changed.go"})
@@ -119,6 +111,7 @@ func TestScanWithFakeScanner(t *testing.T) {
 	store := core.NewJSONStore(cfg.Paths.Workspace)
 
 	a := New(cfg, bus, store, &llm.FakeRunner{Response: "{}"})
+	defer a.Wait()
 	a.scanners = []core.Scanner{
 		&fakeScanner{
 			findings: []*core.Finding{
@@ -158,12 +151,38 @@ func TestScanWithFakeScanner(t *testing.T) {
 	}
 }
 
+func TestExportReports(t *testing.T) {
+	cfg := newTestConfig(t)
+	bus := eventbus.NewLocal()
+	store := core.NewJSONStore(cfg.Paths.Workspace)
+	a := New(cfg, bus, store, &llm.FakeRunner{Response: "{}"})
+
+	targetDir := t.TempDir()
+	workDir := store.WorkspacePath(targetDir)
+	bm := core.NewBlackboardManager(workDir, store, bus)
+	_ = bm.Init(targetDir)
+	_, _ = bm.AddFinding("H1", "test finding", "desc", "high", "evidence")
+	a.managers[targetDir] = bm
+
+	a.exportReports(workDir, targetDir, time.Second)
+
+	reportsDir := filepath.Join(workDir, "reports")
+	entries, err := os.ReadDir(reportsDir)
+	if err != nil {
+		t.Fatalf("read reports dir: %v", err)
+	}
+	if len(entries) != 5 {
+		t.Fatalf("expected 5 reports, got %d", len(entries))
+	}
+}
+
 func TestScanWithOutputFile(t *testing.T) {
 	cfg := newTestConfig(t)
 	bus := eventbus.NewLocal()
 	store := core.NewJSONStore(cfg.Paths.Workspace)
 
 	a := New(cfg, bus, store, &llm.FakeRunner{Response: "{}"})
+	defer a.Wait()
 	a.scanners = []core.Scanner{
 		&fakeScanner{
 			findings: []*core.Finding{
@@ -172,7 +191,7 @@ func TestScanWithOutputFile(t *testing.T) {
 					Description: "from fake scanner",
 					Severity:    core.SeverityMedium,
 					Evidence:    "out.go:2 test",
-					FindingType: core.FindingTypeSemantic,
+					FindingType: core.FindingTypeZeroDay,
 					Location:    &core.Location{File: "out.go", Line: 2},
 				},
 			},
@@ -214,6 +233,7 @@ func TestScanFiltersByChangedPaths(t *testing.T) {
 	store := core.NewJSONStore(cfg.Paths.Workspace)
 
 	a := New(cfg, bus, store, &llm.FakeRunner{Response: "{}"})
+	defer a.Wait()
 	a.scanners = []core.Scanner{
 		&fakeScanner{
 			findings: []*core.Finding{
@@ -222,7 +242,7 @@ func TestScanFiltersByChangedPaths(t *testing.T) {
 					Description: "in changed file",
 					Severity:    core.SeverityHigh,
 					Evidence:    "changed.go:1 issue",
-					FindingType: core.FindingTypeSemantic,
+					FindingType: core.FindingTypeZeroDay,
 					Location:    &core.Location{File: filepath.Join("/repo", "changed.go"), Line: 1},
 				},
 				{
@@ -230,7 +250,7 @@ func TestScanFiltersByChangedPaths(t *testing.T) {
 					Description: "in unchanged file",
 					Severity:    core.SeverityLow,
 					Evidence:    "unchanged.go:1 issue",
-					FindingType: core.FindingTypeSemantic,
+					FindingType: core.FindingTypeZeroDay,
 					Location:    &core.Location{File: filepath.Join("/repo", "unchanged.go"), Line: 1},
 				},
 			},

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"zdll/internal/version"
 )
 
 // HypothesisStatus mirrors Python HypothesisStatus.
@@ -44,6 +46,14 @@ const (
 	SeverityMedium   = "medium"
 	SeverityLow      = "low"
 	SeverityNone     = "none"
+)
+
+// FindingStatus tracks the adjudication state of a finding.
+const (
+	FindingStatusConfirmed   = "confirmed"
+	FindingStatusNeedsReview = "needs_review"
+	FindingStatusRejected    = "rejected"
+	FindingStatusDowngraded  = "downgraded"
 )
 
 // PoCStatus mirrors Python poc_status.
@@ -124,6 +134,7 @@ type DroneTask struct {
 	Error        *string    `json:"error,omitempty"`
 	CreatedAt    float64    `json:"created_at"`
 	CompletedAt  *float64   `json:"completed_at,omitempty"`
+	Integrated   bool       `json:"integrated,omitempty"`
 }
 
 func NewDroneTask(hypothesisID, description, role string) *DroneTask {
@@ -164,6 +175,8 @@ type Finding struct {
 	PackageName    string                `json:"package_name"`
 	PackageVersion string                `json:"package_version"`
 	FixedVersion   string                `json:"fixed_version"`
+	Status         string                `json:"status"`
+	RejectedReason string                `json:"rejected_reason,omitempty"`
 }
 
 func NewFinding(hypothesisID, title, description, severity, evidence string) *Finding {
@@ -178,6 +191,7 @@ func NewFinding(hypothesisID, title, description, severity, evidence string) *Fi
 		PoCStatus:     PoCPending,
 		FindingType:   FindingTypeZeroDay,
 		Prerequisites: NewExploitPrerequisites(),
+		Status:        FindingStatusConfirmed,
 	}
 }
 
@@ -200,16 +214,17 @@ func SeverityRank(severity string) int {
 // Blackboard is the single source of truth for an analysis session.
 // Field names match the Python snapshot format so existing workspaces can be resumed.
 type Blackboard struct {
-	Target     string                     `json:"target"`
-	Active     bool                       `json:"active"`
-	Hypotheses map[string]*HypothesisNode `json:"hypotheses"`
-	Tasks      map[string]*DroneTask      `json:"tasks"`
-	Findings   []*Finding                 `json:"findings"`
-	Round      int                        `json:"round"`
-	TotalTasks int                        `json:"total_tasks"`
-	CreatedAt  float64                    `json:"created_at"`
-	UpdatedAt  float64                    `json:"updated_at"`
-	Engine     string                     `json:"engine"`
+	Target       string                     `json:"target"`
+	Active       bool                       `json:"active"`
+	Hypotheses   map[string]*HypothesisNode `json:"hypotheses"`
+	Tasks        map[string]*DroneTask      `json:"tasks"`
+	Findings     []*Finding                 `json:"findings"`
+	Round        int                        `json:"round"`
+	TotalTasks   int                        `json:"total_tasks"`
+	CreatedAt    float64                    `json:"created_at"`
+	UpdatedAt    float64                    `json:"updated_at"`
+	Engine       string                     `json:"engine"`
+	ArtifactsDir string                     `json:"artifacts_dir,omitempty"`
 }
 
 func NewBlackboard(target string) *Blackboard {
@@ -222,7 +237,7 @@ func NewBlackboard(target string) *Blackboard {
 		Findings:   []*Finding{},
 		CreatedAt:  now,
 		UpdatedAt:  now,
-		Engine:     "HIVE-MIND INTEL ENGINE V8.0",
+		Engine:     version.Engine,
 	}
 }
 
@@ -247,6 +262,9 @@ func (bb *Blackboard) Stats() map[string]int {
 	zeroDay := 0
 	depVuln := 0
 	for _, f := range bb.Findings {
+		if f.Status == FindingStatusRejected {
+			continue
+		}
 		if f.FindingType == FindingTypeDependency {
 			depVuln++
 		} else {
@@ -265,7 +283,7 @@ func (bb *Blackboard) Stats() map[string]int {
 		"discarded":         discarded,
 		"pending":           pending,
 		"suspected":         suspected,
-		"total_findings":    len(bb.Findings),
+		"total_findings":    zeroDay + depVuln,
 		"zero_day_findings": zeroDay,
 		"dependency_vulns":  depVuln,
 		"tasks_executed":    tasksExecuted,

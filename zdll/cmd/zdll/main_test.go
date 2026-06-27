@@ -120,8 +120,11 @@ func TestConfigValidateCommand(t *testing.T) {
 	if !strings.Contains(out, "Configuration is valid") {
 		t.Errorf("output missing valid message: %q", out)
 	}
-	if !strings.Contains(out, "...1234") {
+	if !strings.Contains(out, "********") {
 		t.Errorf("output missing masked key: %q", out)
+	}
+	if strings.Contains(out, "sk-test1234") {
+		t.Errorf("output leaked raw api key: %q", out)
 	}
 }
 

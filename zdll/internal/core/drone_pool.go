@@ -2,6 +2,9 @@ package core
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,40 +14,34 @@ import (
 	"zdll/internal/llm"
 )
 
-// DronePool limits concurrent drone executions and optionally reuses pooled sessions.
+// DronePool limits concurrent drone executions.
 type DronePool struct {
-	capacity  int
-	sem       chan struct{}
-	wg        WaitGroupWithCounter
-	bus       eventbus.Bus
-	runner    llm.AgentRunner
-	pool      *DroneSessionPool
-	rootDir   string
-	targetDir string
-	bm        *BlackboardManager
+	capacity     int
+	sem          chan struct{}
+	wg           WaitGroupWithCounter
+	bus          eventbus.Bus
+	runner       llm.AgentRunner
+	rootDir      string
+	targetDir    string
+	artifactsDir string
+	bm           *BlackboardManager
 }
 
 // NewDronePool creates a pool with the given capacity.
-func NewDronePool(capacity int, runner llm.AgentRunner, targetDir, rootDir string, bm *BlackboardManager, bus eventbus.Bus) *DronePool {
+func NewDronePool(capacity int, runner llm.AgentRunner, targetDir, rootDir, artifactsDir string, bm *BlackboardManager, bus eventbus.Bus) *DronePool {
 	if capacity <= 0 {
 		capacity = 3
 	}
 	return &DronePool{
-		capacity:  capacity,
-		sem:       make(chan struct{}, capacity),
-		runner:    runner,
-		rootDir:   rootDir,
-		targetDir: targetDir,
-		bm:        bm,
-		bus:       bus,
+		capacity:     capacity,
+		sem:          make(chan struct{}, capacity),
+		runner:       runner,
+		rootDir:      rootDir,
+		targetDir:    targetDir,
+		artifactsDir: artifactsDir,
+		bm:           bm,
+		bus:          bus,
 	}
-}
-
-// NewDronePoolWithSession creates a pool that prefers reusable sessions.
-func NewDronePoolWithSession(capacity int, pool *DroneSessionPool, runner llm.AgentRunner, targetDir, rootDir string, bm *BlackboardManager, bus eventbus.Bus) *DronePool {
-	p := NewDronePool(capacity, runner, targetDir, rootDir, bm, bus)
-	p.pool = pool
-	return p
 }
 
 // SetCapacity resizes the pool capacity (applies to future acquires).
@@ -62,9 +59,11 @@ func (p *DronePool) Active() int {
 
 // Submit runs a task asynchronously, bounded by capacity.
 func (p *DronePool) Submit(ctx context.Context, t *DroneTask) error {
+	log.Printf("[drone-pool] submitting task %s (role=%s, active=%d, cap=%d)", t.ID, t.DroneRole, p.Active(), p.capacity)
 	select {
 	case p.sem <- struct{}{}:
 	case <-ctx.Done():
+		log.Printf("[drone-pool] submit cancelled for task %s: %v", t.ID, ctx.Err())
 		return ctx.Err()
 	}
 
@@ -72,44 +71,74 @@ func (p *DronePool) Submit(ctx context.Context, t *DroneTask) error {
 	go func() {
 		defer p.wg.Done()
 		defer func() { <-p.sem }()
+		const maxRetries = 2
+		var finalErr error
 
-		p.publish(event.DroneLaunched, map[string]any{
-			"task_id": t.ID,
-			"role":    t.DroneRole,
-		})
-
-		_ = p.bm.UpdateTask(t.ID, TaskRunning, nil, nil)
-
-		drone := NewDrone(t.ID, t.Description, t.DroneRole, p.targetDir, p.rootDir)
-
-		var result string
-		var err error
-		if p.pool != nil {
-			if session, sandboxDir, release, acquireErr := p.pool.Acquire(ctx, t.DroneRole); acquireErr == nil {
-				result, err = drone.ExecuteWithSession(ctx, session, sandboxDir)
-				release()
-			} else {
-				// Fallback to on-demand runner when pool is exhausted.
-				result, err = drone.Execute(ctx, p.runner)
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				backoff := time.Duration(attempt*2) * time.Second
+				log.Printf("[drone-pool] retrying task %s (attempt=%d/%d, backoff=%s)", t.ID, attempt, maxRetries, backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					finalErr = ctx.Err()
+					break
+				}
 			}
-		} else {
-			result, err = drone.Execute(ctx, p.runner)
+
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						finalErr = fmt.Errorf("drone panic: %v", rec)
+						log.Printf("[drone-pool] task %s panic on attempt %d: %v", t.ID, attempt, rec)
+					}
+				}()
+
+				log.Printf("[drone-pool] task %s launched (role=%s, attempt=%d)", t.ID, t.DroneRole, attempt)
+				p.publish(event.DroneLaunched, map[string]any{
+					"task_id": t.ID,
+					"role":    t.DroneRole,
+					"attempt": attempt,
+				})
+
+				if err := p.bm.UpdateTask(t.ID, TaskRunning, nil, nil); err != nil {
+					log.Printf("[drone-pool] task %s UpdateTask running failed: %v", t.ID, err)
+				}
+
+				drone := NewDrone(t.ID, t.Description, t.DroneRole, p.targetDir, p.rootDir, p.artifactsDir)
+				result, err := drone.Execute(ctx, p.runner)
+				if err == nil {
+					log.Printf("[drone-pool] task %s completed (result=%d chars)", t.ID, len(result))
+					_ = p.bm.UpdateTask(t.ID, TaskDone, &result, nil)
+					p.publish(event.DroneCompleted, map[string]any{
+						"task_id": t.ID,
+						"role":    t.DroneRole,
+					})
+					finalErr = nil
+					return
+				}
+
+				finalErr = err
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+			}()
+
+			if finalErr == nil {
+				return
+			}
+			if errors.Is(finalErr, context.Canceled) {
+				break
+			}
 		}
 
-		if err != nil {
-			errStr := err.Error()
-			_ = p.bm.UpdateTask(t.ID, TaskFailed, nil, &errStr)
-			p.publish(event.DroneFailed, map[string]any{
-				"task_id": t.ID,
-				"error":   errStr,
-			})
-		} else {
-			_ = p.bm.UpdateTask(t.ID, TaskDone, &result, nil)
-			p.publish(event.DroneCompleted, map[string]any{
-				"task_id": t.ID,
-				"role":    t.DroneRole,
-			})
-		}
+		errStr := finalErr.Error()
+		log.Printf("[drone-pool] task %s failed after retries: %v", t.ID, errStr)
+		_ = p.bm.UpdateTask(t.ID, TaskFailed, nil, &errStr)
+		p.publish(event.DroneFailed, map[string]any{
+			"task_id": t.ID,
+			"error":   errStr,
+		})
 	}()
 
 	return nil
