@@ -31,7 +31,7 @@ func TestDomainDetector_FallbackToFoundation(t *testing.T) {
 
 func TestDomainContext_LoadsTerrainAndPipeline(t *testing.T) {
 	skillsDir := filepath.Join("..", "..", "skills")
-	dc := NewDomainContext(skillsDir)
+	dc := NewDomainContext(NewPlainSkillFS(skillsDir))
 	dc.DetectFromDocIntel(&DocIntelReport{
 		DependencyFiles: []string{"go.mod"},
 	})
@@ -56,7 +56,7 @@ func TestDomainContext_LoadsTerrainAndPipeline(t *testing.T) {
 
 func TestLoadSecurityExpertBrief(t *testing.T) {
 	skillsDir := filepath.Join("..", "..", "skills")
-	brief := loadSecurityExpertBrief(skillsDir)
+	brief := loadSecurityExpertBrief(NewPlainSkillFS(skillsDir))
 	if brief == "" {
 		t.Fatal("expected non-empty security-expert brief")
 	}

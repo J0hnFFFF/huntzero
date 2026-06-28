@@ -26,6 +26,8 @@ import (
 	"zdll/internal/event"
 	"zdll/internal/eventbus"
 	"zdll/internal/exploit"
+	"zdll/internal/licensing"
+	"zdll/internal/skillvault"
 	"zdll/internal/report"
 	"zdll/internal/scanner"
 	"zdll/internal/util"
@@ -51,6 +53,8 @@ type cliFlags struct {
 	diffBase         string
 	generateBaseline string
 	summaryFormat    string
+	licenseKey       string
+	licenseServerURL string
 }
 
 var flags cliFlags
@@ -106,6 +110,8 @@ func newRootCmd() *cobra.Command {
 	}
 
 	rootCmd.PersistentFlags().StringVar(&flags.cfgFile, "config", "", "config file path")
+	rootCmd.PersistentFlags().StringVar(&flags.licenseKey, "license", os.Getenv("ZDLL_LICENSE_KEY"), "subscription license key")
+	rootCmd.PersistentFlags().StringVar(&flags.licenseServerURL, "license-server", os.Getenv("ZDLL_LICENSE_SERVER_URL"), "license server URL")
 
 	scanCmd := &cobra.Command{
 		Use:   "scan <target>",
@@ -252,6 +258,13 @@ func runScanCommon(cmd *cobra.Command, args []string, ciMode bool) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 	applyScanFlagOverrides(cfg, ciMode)
+	applyLicenseFlagOverrides(cfg)
+
+	skillFS, err := resolveSkillFS(cfg)
+	if err != nil {
+		return fmt.Errorf("license/skills: %w", err)
+	}
+
 	if cfg.LLM.APIKey == "" {
 		return fmt.Errorf("LLM API key is required (set KIMI_API_KEY or ZDLL_LLM_API_KEY env var, or llm.api_key in config)")
 	}
@@ -299,7 +312,8 @@ func runScanCommon(cmd *cobra.Command, args []string, ciMode bool) error {
 	application := app.New(cfg, bus, core.NewJSONStore(cfg.Paths.Workspace), cerebrumRunner).
 		WithDroneRunner(droneRunner).
 		WithExploitAnalyzer(exploitAnalyzer).
-		WithLLMModel(chatModel)
+		WithLLMModel(chatModel).
+		WithSkillFS(skillFS)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -332,6 +346,63 @@ func runScanCommon(cmd *cobra.Command, args []string, ciMode bool) error {
 	application.Wait()
 
 	return finalizeScan(cmd, cfg, bm, target, start, changedPaths, ciMode, logger)
+}
+
+func applyLicenseFlagOverrides(cfg *config.Config) {
+	if flags.licenseKey != "" {
+		cfg.License.Key = flags.licenseKey
+	}
+	if flags.licenseServerURL != "" {
+		cfg.License.ServerURL = flags.licenseServerURL
+	}
+}
+
+func resolveSkillFS(cfg *config.Config) (core.SkillFS, error) {
+	// If the configured skills path is an encrypted bundle file, or a directory
+	// containing skills.vault, decrypt it.
+	vaultPath, isVault := detectVault(cfg.Paths.Skills)
+	if !isVault {
+		return core.NewPlainSkillFS(cfg.Paths.Skills), nil
+	}
+
+	if cfg.License.Key == "" {
+		return nil, fmt.Errorf("encrypted skill vault found at %s but no license key provided (set --license or license.key)", vaultPath)
+	}
+
+	lic := licensing.New(cfg.License.Key, cfg.License.ServerURL)
+	// Production deployments should embed a real public key at build time.
+	if pub := os.Getenv("ZDLL_LICENSE_PUBLIC_KEY"); pub != "" {
+		lic.WithPublicKey(pub)
+	}
+
+	claims, err := lic.Validate(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("validate license: %w", err)
+	}
+	dek, err := claims.DEKBytes()
+	if err != nil {
+		return nil, fmt.Errorf("decode dek: %w", err)
+	}
+
+	vault, err := skillvault.New(vaultPath, dek)
+	if err != nil {
+		return nil, fmt.Errorf("open skill vault: %w", err)
+	}
+	return core.NewCachedSkillFS(vault), nil
+}
+
+func detectVault(skillsPath string) (string, bool) {
+	if fi, err := os.Stat(skillsPath); err == nil && !fi.IsDir() {
+		if strings.HasSuffix(strings.ToLower(skillsPath), ".vault") {
+			return skillsPath, true
+		}
+		return "", false
+	}
+	vaultPath := filepath.Join(skillsPath, "skills.vault")
+	if _, err := os.Stat(vaultPath); err == nil {
+		return vaultPath, true
+	}
+	return "", false
 }
 
 func applyScanFlagOverrides(cfg *config.Config, ciMode bool) {
@@ -666,6 +737,10 @@ func getConfigValue(cfg *config.Config, key string) (string, error) {
 		return cfg.Paths.Skills, nil
 	case "paths.osv_scanner":
 		return cfg.Paths.OSVScanner, nil
+	case "license.key":
+		return cfg.License.Key, nil
+	case "license.server_url":
+		return cfg.License.ServerURL, nil
 	default:
 		return "", fmt.Errorf("unknown config key: %s", key)
 	}
@@ -718,6 +793,10 @@ func setConfigValue(cfg *config.Config, key, value string) error {
 		cfg.Paths.Skills = value
 	case "paths.osv_scanner":
 		cfg.Paths.OSVScanner = value
+	case "license.key":
+		cfg.License.Key = value
+	case "license.server_url":
+		cfg.License.ServerURL = value
 	default:
 		return fmt.Errorf("unknown config key: %s", key)
 	}
@@ -757,6 +836,10 @@ func unsetConfigValue(cfg *config.Config, key string) error {
 		cfg.Paths.Skills = defaults.Paths.Skills
 	case "paths.osv_scanner":
 		cfg.Paths.OSVScanner = defaults.Paths.OSVScanner
+	case "license.key":
+		cfg.License.Key = defaults.License.Key
+	case "license.server_url":
+		cfg.License.ServerURL = defaults.License.ServerURL
 	default:
 		return fmt.Errorf("unknown config key: %s", key)
 	}

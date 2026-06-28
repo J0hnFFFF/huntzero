@@ -27,7 +27,7 @@ func TestSpawnExplorationDrones_TriggersEveryFiveRounds(t *testing.T) {
 		MaxTime:   5 * time.Second,
 		Scanners:  []Scanner{fakeScanner{}},
 	}
-	engine := NewEngine(cfg, &fakeRunner{}, dir, dir, dir, bus)
+	engine := NewEngine(cfg, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus)
 	bm.SetRound(5)
 
 	pool := NewDronePool(1, &fakeRunner{}, dir, dir, "", bm, bus)

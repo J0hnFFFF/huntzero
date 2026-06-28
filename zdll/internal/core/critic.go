@@ -16,21 +16,21 @@ import (
 
 // Critic reviews hypotheses and findings for quality, duplicates, and gaps.
 type Critic struct {
-	runner    llm.AgentRunner
-	rootDir   string
-	skillsDir string
-	bus       eventbus.Bus
-	maxTasks  int
+	runner   llm.AgentRunner
+	rootDir  string
+	skillFS  SkillFS
+	bus      eventbus.Bus
+	maxTasks int
 }
 
 // NewCritic creates a new Critic.
-func NewCritic(runner llm.AgentRunner, rootDir, skillsDir string, bus eventbus.Bus) *Critic {
+func NewCritic(runner llm.AgentRunner, rootDir string, skillFS SkillFS, bus eventbus.Bus) *Critic {
 	return &Critic{
-		runner:    runner,
-		rootDir:   rootDir,
-		skillsDir: skillsDir,
-		bus:       bus,
-		maxTasks:  6,
+		runner:   runner,
+		rootDir:  rootDir,
+		skillFS:  skillFS,
+		bus:      bus,
+		maxTasks: 6,
 	}
 }
 
@@ -62,7 +62,7 @@ func (c *Critic) Review(ctx context.Context, bm *BlackboardManager) error {
 	cfg := llm.AgentConfig{
 		Role:      "critic",
 		WorkDir:   bm.WorkDir(),
-		SkillsDir: c.skillsDir,
+		SkillsDir: "",
 		Thinking:  true,
 	}
 	events, err := c.runner.Run(ctx, cfg, prompt)
@@ -195,7 +195,7 @@ func (c *Critic) Judge(ctx context.Context, task *DroneTask, hypothesis *Hypothe
 	cfg := llm.AgentConfig{
 		Role:      "critic",
 		WorkDir:   c.rootDir,
-		SkillsDir: c.skillsDir,
+		SkillsDir: "",
 		Thinking:  true,
 	}
 

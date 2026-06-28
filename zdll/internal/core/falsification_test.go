@@ -29,7 +29,7 @@ EVIDENCE: The query uses parameterized statements.
 `
 	_ = bm.UpdateTask(tid, TaskDone, &result, nil)
 
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus)
 	engine.integrateResults(context.Background(), bm)
 
 	h := bm.Snapshot().Hypotheses[hid]
@@ -66,7 +66,7 @@ EVIDENCE: query := "SELECT * FROM users WHERE name='" + name + "'"
 `
 	_ = bm.UpdateTask(tid, TaskDone, &result, nil)
 
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus)
 	engine.integrateResults(context.Background(), bm)
 
 	h := bm.Snapshot().Hypotheses[hid]

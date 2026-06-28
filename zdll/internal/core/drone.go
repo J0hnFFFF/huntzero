@@ -106,6 +106,7 @@ type Drone struct {
 	WorkDir             string // original target project
 	RootDir             string // zdll root
 	ArtifactsDir        string // directory for PoCs, harnesses, and harvested reports
+	SkillFS             SkillFS
 	Config              any    // unused but kept for compatibility
 	originalWorkDir     string
 	sandbox             string
@@ -114,7 +115,7 @@ type Drone struct {
 }
 
 // NewDrone creates a new Drone instance.
-func NewDrone(taskID, taskDesc, droneRole, workDir, rootDir, artifactsDir string) *Drone {
+func NewDrone(taskID, taskDesc, droneRole, workDir, rootDir, artifactsDir string, skillFS SkillFS) *Drone {
 	return &Drone{
 		TaskID:          taskID,
 		TaskDesc:        taskDesc,
@@ -122,6 +123,7 @@ func NewDrone(taskID, taskDesc, droneRole, workDir, rootDir, artifactsDir string
 		WorkDir:         workDir,
 		RootDir:         rootDir,
 		ArtifactsDir:    artifactsDir,
+		SkillFS:         skillFS,
 		originalWorkDir: workDir,
 	}
 }
@@ -350,26 +352,21 @@ func (d *Drone) systemPromptPrefix() string {
 }
 
 func (d *Drone) loadHarnessGuidelines() string {
-	if d.DroneRole != "harness-generator" || d.RootDir == "" {
+	if d.DroneRole != "harness-generator" || d.SkillFS == nil {
 		return ""
 	}
-	skillsDir := filepath.Join(d.RootDir, "skills")
-	entries, err := os.ReadDir(skillsDir)
+	entries, err := d.SkillFS.ReadDir(".")
 	if err != nil {
 		return ""
 	}
 
 	var parts []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		path := filepath.Join(skillsDir, e.Name(), "references", "fuzz-harness.md")
-		data, err := os.ReadFile(path)
+	for _, name := range entries {
+		data, err := d.SkillFS.ReadFile(name + "/references/fuzz-harness.md")
 		if err != nil {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("--- Fuzz Harness Guidelines (%s) ---\n%s", e.Name(), string(data)))
+		parts = append(parts, fmt.Sprintf("--- Fuzz Harness Guidelines (%s) ---\n%s", name, string(data)))
 	}
 
 	if len(parts) == 0 {

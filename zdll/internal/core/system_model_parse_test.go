@@ -30,7 +30,7 @@ func TestParseAndApply_SystemModel(t *testing.T) {
   "untested_assumptions": ["only admins reach /admin"]
 }`
 
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus)
 	_, _, _, err := engine.parseAndApply(context.Background(), bm, resp)
 	if err != nil {
 		t.Fatalf("parseAndApply: %v", err)

@@ -34,7 +34,7 @@ func TestEngineRun_SmallProject(t *testing.T) {
 	}
 	runner := &llm.FakeRunner{Response: `{"hypotheses":[],"tasks":[],"findings":[]}`}
 
-	e := NewEngine(cfg, runner, "./skills", ".", dir, nil)
+	e := NewEngine(cfg, runner, NewPlainSkillFS("./skills"), ".", dir, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := e.Run(ctx, bm); err != nil {

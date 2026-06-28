@@ -2,7 +2,6 @@ package core
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -52,15 +51,15 @@ type DomainContext struct {
 	Terrain    string
 	Pipeline   []*DomainPhase
 	CurrentIdx int
-	SkillsDir  string
+	skillFS    SkillFS
 	detector   *domainDetector
 }
 
-// NewDomainContext creates an empty domain context rooted at skillsDir.
-func NewDomainContext(skillsDir string) *DomainContext {
+// NewDomainContext creates an empty domain context using the provided SkillFS.
+func NewDomainContext(skillFS SkillFS) *DomainContext {
 	return &DomainContext{
-		SkillsDir: skillsDir,
-		detector:  newDomainDetector(),
+		skillFS:  skillFS,
+		detector: newDomainDetector(),
 	}
 }
 
@@ -205,12 +204,11 @@ func (dc *DomainContext) ShouldAdvancePhase() bool {
 // loadSecurityExpertBrief reads the security-expert routing table. The Python
 // implementation loads this into the Cerebrum system prompt before Round 0 so
 // the model can reason about which domains apply to the project.
-func loadSecurityExpertBrief(skillsDir string) string {
-	if skillsDir == "" {
+func loadSecurityExpertBrief(skillFS SkillFS) string {
+	if skillFS == nil {
 		return ""
 	}
-	path := filepath.Join(skillsDir, "security-expert", "SKILL.md")
-	content, err := os.ReadFile(path)
+	content, err := skillFS.ReadFile("security-expert/SKILL.md")
 	if err != nil {
 		return ""
 	}
@@ -223,7 +221,7 @@ func loadSecurityExpertBrief(skillsDir string) string {
 }
 
 func (dc *DomainContext) loadTerrain() string {
-	if dc.SkillsDir == "" {
+	if dc.skillFS == nil {
 		return ""
 	}
 	var briefs []string
@@ -231,8 +229,7 @@ func (dc *DomainContext) loadTerrain() string {
 		if name == "security-expert" {
 			continue
 		}
-		path := filepath.Join(dc.SkillsDir, name, "SKILL.md")
-		content, err := os.ReadFile(path)
+		content, err := dc.skillFS.ReadFile(name + "/SKILL.md")
 		if err != nil {
 			continue
 		}
@@ -251,14 +248,13 @@ func (dc *DomainContext) loadTerrain() string {
 }
 
 func (dc *DomainContext) buildPipeline() []*DomainPhase {
-	if dc.SkillsDir == "" {
+	if dc.skillFS == nil {
 		return nil
 	}
 	// Only domains that have a references/ directory contribute phases.
 	active := make([]string, 0, len(dc.Domains))
 	for _, d := range dc.Domains {
-		info, err := os.Stat(filepath.Join(dc.SkillsDir, d, "references"))
-		if err == nil && info.IsDir() {
+		if dc.skillFS.Stat(d + "/references") {
 			active = append(active, d)
 		}
 	}
@@ -270,8 +266,7 @@ func (dc *DomainContext) buildPipeline() []*DomainPhase {
 	for idx, name := range PhaseOrder {
 		var parts []string
 		for _, domain := range active {
-			path := filepath.Join(dc.SkillsDir, domain, "references", name+".md")
-			content, err := os.ReadFile(path)
+			content, err := dc.skillFS.ReadFile(domain + "/references/" + name + ".md")
 			if err != nil {
 				continue
 			}

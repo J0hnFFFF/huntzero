@@ -25,7 +25,7 @@ type Engine struct {
 	cfg             *EngineConfig
 	runner          llm.AgentRunner
 	droneRunner     llm.AgentRunner
-	skillsDir       string
+	skillFS         SkillFS
 	rootDir         string
 	targetDir       string
 	bus             eventbus.Bus
@@ -60,7 +60,7 @@ type EngineConfig struct {
 }
 
 // NewEngine creates a new Cerebrum engine.
-func NewEngine(cfg *EngineConfig, runner llm.AgentRunner, skillsDir, rootDir, targetDir string, bus eventbus.Bus) *Engine {
+func NewEngine(cfg *EngineConfig, runner llm.AgentRunner, skillFS SkillFS, rootDir, targetDir string, bus eventbus.Bus) *Engine {
 	if cfg == nil {
 		cfg = &EngineConfig{}
 	}
@@ -82,13 +82,13 @@ func NewEngine(cfg *EngineConfig, runner llm.AgentRunner, skillsDir, rootDir, ta
 	return &Engine{
 		cfg:                              cfg,
 		runner:                           runner,
-		skillsDir:                        skillsDir,
+		skillFS:                          skillFS,
 		rootDir:                          rootDir,
 		targetDir:                        targetDir,
 		bus:                              bus,
 		scanners:                         cfg.Scanners,
 		docIntel:                         NewDocIntel(targetDir),
-		securityExpertBrief:              loadSecurityExpertBrief(skillsDir),
+		securityExpertBrief:              loadSecurityExpertBrief(skillFS),
 		followedUps:                      make(map[string]struct{}),
 		devilsAdvocateScheduled:          make(map[string]struct{}),
 		hypothesisFalsificationScheduled: make(map[string]struct{}),
@@ -138,13 +138,13 @@ func (e *Engine) Run(ctx context.Context, bm *BlackboardManager) error {
 	e.publish(event.CerebrumStarted, map[string]any{"target": bm.Snapshot().Target})
 
 	// Sector decomposition for large projects.
-	sectorMgr := NewSectorManagerWithLLM(e.targetDir, e.runner, e.rootDir, e.skillsDir)
+	sectorMgr := NewSectorManagerWithLLM(e.targetDir, e.runner, e.rootDir, "")
 	needsSector, err := sectorMgr.NeedsDecomposition()
 	if err == nil && needsSector {
 		sectors, err := sectorMgr.Decompose()
 		if err == nil && len(sectors) > 0 {
 			coord := NewCoordinator(func(targetDir string) *Engine {
-				eng := NewEngine(e.cfg, e.runner, e.skillsDir, e.rootDir, targetDir, e.bus).
+				eng := NewEngine(e.cfg, e.runner, e.skillFS, e.rootDir, targetDir, e.bus).
 					WithCritic(e.critic).
 					WithExploitAnalyzer(e.exploitAnalyzer)
 				if e.droneRunner != nil {
@@ -175,7 +175,7 @@ func (e *Engine) runSingle(ctx context.Context, bm *BlackboardManager) error {
 		if err == nil {
 			docReport = report
 			// Detect domains and load terrain / phase pipeline from skills.
-			e.domainCtx = NewDomainContext(e.skillsDir)
+			e.domainCtx = NewDomainContext(e.skillFS)
 			e.domainCtx.DetectFromDocIntel(report)
 			e.publish(event.CerebrumThought, map[string]any{
 				"text": fmt.Sprintf("[domain] detected domains: %s", strings.Join(e.domainCtx.Domains, ", ")),
@@ -244,7 +244,7 @@ func (e *Engine) runSingle(ctx context.Context, bm *BlackboardManager) error {
 		}
 	}
 
-	dronePool := NewDronePool(e.cfg.Workers, droneRunner, e.targetDir, e.rootDir, e.cfg.ArtifactsDir, bm, e.bus)
+	dronePool := NewDronePool(e.cfg.Workers, droneRunner, e.targetDir, e.rootDir, e.cfg.ArtifactsDir, bm, e.bus).WithSkillFS(e.skillFS)
 	defer dronePool.Wait()
 
 	round := bm.Snapshot().Round
@@ -1949,7 +1949,7 @@ func (e *Engine) strategicRecon(ctx context.Context, bm *BlackboardManager, runn
 
 	prompt := fmt.Sprintf(strategicReconPromptTemplate, sb.String())
 	taskID := fmt.Sprintf("strategic-recon-%d", time.Now().Unix())
-	drone := NewDrone(taskID, prompt, "scope-definer", e.targetDir, e.rootDir, e.cfg.ArtifactsDir)
+	drone := NewDrone(taskID, prompt, "scope-definer", e.targetDir, e.rootDir, e.cfg.ArtifactsDir, e.skillFS)
 	out, err := drone.Execute(ctx, runner)
 	if err != nil {
 		e.publish(event.Error, map[string]any{"source": "strategic-recon", "message": err.Error()})

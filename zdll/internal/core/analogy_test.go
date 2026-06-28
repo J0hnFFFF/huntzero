@@ -3,7 +3,7 @@ package core
 import "testing"
 
 func TestDomainContext_AnalogyPrompts(t *testing.T) {
-	dc := NewDomainContext("")
+	dc := NewDomainContext(nil)
 	dc.Domains = []string{"ai-agent", "web"}
 
 	prompt := dc.AnalogyPrompts()
@@ -16,7 +16,7 @@ func TestDomainContext_AnalogyPrompts(t *testing.T) {
 }
 
 func TestDomainContext_AnalogyPrompts_SingleDomain(t *testing.T) {
-	dc := NewDomainContext("")
+	dc := NewDomainContext(nil)
 	dc.Domains = []string{"web"}
 	if dc.AnalogyPrompts() != "" {
 		t.Error("expected no analogy prompt with a single domain")

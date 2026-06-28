@@ -32,6 +32,7 @@ type App struct {
 	droneRunner     llm.AgentRunner
 	exploitAnalyzer *exploit.Analyzer
 	llmModel        model.BaseChatModel
+	skillFS         core.SkillFS
 	managers        map[string]*core.BlackboardManager
 	// scanners optionally overrides the scanners used by the engine. When nil,
 	// scanner.All(cfg) is used.
@@ -107,6 +108,13 @@ func (a *App) WithLLMModel(m model.BaseChatModel) *App {
 	return a
 }
 
+// WithSkillFS sets the SkillFS used to load skill content. When unset, the
+// engine falls back to a plain filesystem adapter based on cfg.Paths.Skills.
+func (a *App) WithSkillFS(fs core.SkillFS) *App {
+	a.skillFS = fs
+	return a
+}
+
 // Scan starts a new analysis.
 func (a *App) Scan(ctx context.Context, target string, resume bool, opts ...ScanOption) (*core.BlackboardManager, error) {
 	options := &ScanOptions{}
@@ -160,7 +168,11 @@ func (a *App) Scan(ctx context.Context, target string, resume bool, opts ...Scan
 		Scanners:     coreScanners,
 		ArtifactsDir: filepath.Join(workDir, "artifacts"),
 	}
-	engine := core.NewEngine(engineCfg, a.runner, a.cfg.Paths.Skills, filepath.Dir(a.cfg.Paths.Skills), targetDir, a.bus)
+	skillFS := a.skillFS
+	if skillFS == nil {
+		skillFS = core.NewPlainSkillFS(a.cfg.Paths.Skills)
+	}
+	engine := core.NewEngine(engineCfg, a.runner, skillFS, filepath.Dir(a.cfg.Paths.Skills), targetDir, a.bus)
 	if a.droneRunner != nil {
 		engine.WithDroneRunner(a.droneRunner)
 	}
@@ -169,7 +181,7 @@ func (a *App) Scan(ctx context.Context, target string, resume bool, opts ...Scan
 	} else {
 		engine.WithExploitAnalyzer(exploit.NewAnalyzer())
 	}
-	critic := core.NewCritic(a.runner, filepath.Dir(a.cfg.Paths.Skills), a.cfg.Paths.Skills, a.bus)
+	critic := core.NewCritic(a.runner, filepath.Dir(a.cfg.Paths.Skills), skillFS, a.bus)
 	engine.WithCritic(critic)
 	a.wg.Add(1)
 	go func() {

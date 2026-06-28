@@ -12,7 +12,7 @@ func TestCritic_Judge_Accept(t *testing.T) {
 	runner := &llm.FakeRunner{Response: `<CRITIC decision="ACCEPT" severity="high">
 <reason>Concrete code evidence and reachable sink.</reason>
 </CRITIC>`}
-	critic := NewCritic(runner, ".", "./skills", nil)
+	critic := NewCritic(runner, ".", NewPlainSkillFS("./skills"), nil)
 
 	task := &DroneTask{ID: "T-1", HypothesisID: "H-1", DroneRole: "evidence-collector"}
 	h := &HypothesisNode{ID: "H-1", Description: "SQL injection in login"}
@@ -40,7 +40,7 @@ func TestCritic_Judge_Reject(t *testing.T) {
 	runner := &llm.FakeRunner{Response: `<CRITIC decision="REJECT" severity="none">
 <reason>No concrete code evidence; claim is speculative.</reason>
 </CRITIC>`}
-	critic := NewCritic(runner, ".", "./skills", nil)
+	critic := NewCritic(runner, ".", NewPlainSkillFS("./skills"), nil)
 
 	task := &DroneTask{ID: "T-1", HypothesisID: "H-1", DroneRole: "evidence-collector"}
 	h := &HypothesisNode{ID: "H-1", Description: "Possible SQL injection"}
@@ -65,7 +65,7 @@ func TestCritic_Judge_Reject(t *testing.T) {
 }
 
 func TestCritic_Judge_DefaultAcceptWhenRunnerMissing(t *testing.T) {
-	critic := NewCritic(nil, ".", "./skills", nil)
+	critic := NewCritic(nil, ".", NewPlainSkillFS("./skills"), nil)
 	task := &DroneTask{ID: "T-1"}
 	parsed := map[string]any{"severity": "medium"}
 	decision, _, severity := critic.Judge(context.Background(), task, nil, parsed)

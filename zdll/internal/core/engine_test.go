@@ -41,7 +41,7 @@ func TestParseAndApply(t *testing.T) {
   "tasks": [{"hypothesis_ref":"SQL injection in login","role":"evidence-collector","description":"Check login.go parameter handling"}],
   "findings": [{"title":"SQL injection in login","description":"User input concatenated into query","severity":"high","confidence":0.85,"evidence":"query := \"SELECT * FROM users WHERE name='\" + name + \"'\""}]
 }`
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus)
 	tasks, complete, phaseComplete, err := engine.parseAndApply(context.Background(), bm, resp)
 	if err != nil {
 		t.Fatalf("parseAndApply: %v", err)
@@ -76,7 +76,7 @@ func TestParseAndApply_PhaseComplete(t *testing.T) {
   "phase_complete": true,
   "is_complete": false
 }`
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus)
 	tasks, complete, phaseComplete, err := engine.parseAndApply(context.Background(), bm, resp)
 	if err != nil {
 		t.Fatalf("parseAndApply: %v", err)
@@ -111,7 +111,7 @@ func TestEngine_Run_GeneratesFinding(t *testing.T) {
 		MaxTime:   5 * time.Second,
 		Scanners:  []Scanner{fakeScanner{}},
 	}
-	engine := NewEngine(cfg, runner, dir, dir, dir, bus)
+	engine := NewEngine(cfg, runner, NewPlainSkillFS(dir), dir, dir, bus)
 
 	bm := NewBlackboardManager(filepath.Join(dir, "ws"), store, bus)
 	_ = bm.Init("./testdata")
@@ -156,8 +156,8 @@ TRACE_TARGET: login.go:42
 	criticRunner := &llm.FakeRunner{Response: `<CRITIC decision="ACCEPT" severity="high">
 <reason>Concrete code evidence and reachable user input.</reason>
 </CRITIC>`}
-	critic := NewCritic(criticRunner, dir, "./skills", bus)
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus).WithCritic(critic)
+	critic := NewCritic(criticRunner, dir, NewPlainSkillFS("./skills"), bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus).WithCritic(critic)
 
 	engine.integrateResults(context.Background(), bm)
 
@@ -197,8 +197,8 @@ DETAIL:
 	criticRunner := &llm.FakeRunner{Response: `<CRITIC decision="REJECT" severity="none">
 <reason>No concrete code evidence.</reason>
 </CRITIC>`}
-	critic := NewCritic(criticRunner, dir, "./skills", bus)
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus).WithCritic(critic)
+	critic := NewCritic(criticRunner, dir, NewPlainSkillFS("./skills"), bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus).WithCritic(critic)
 
 	engine.integrateResults(context.Background(), bm)
 
@@ -226,7 +226,7 @@ func TestSweepOrphanedHypotheses_PromotesHighConfidence(t *testing.T) {
 		"evidence": "[confirmed] T-1: high Buffer overflow in parser.c:123",
 	})
 
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus)
 	engine.sweepOrphanedHypotheses(context.Background(), bm)
 
 	stats := bm.Stats()
@@ -266,7 +266,7 @@ func TestParseXMLFallback_NoBackreferencePanic(t *testing.T) {
 <task hypothesis="XSS in search box" role="evidence-collector">Check search.go input sanitization</task>
 </result>`
 
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus)
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus)
 	tasks, complete, err := engine.parseXMLFallback(context.Background(), bm, resp)
 	if err != nil {
 		t.Fatalf("parseXMLFallback: %v", err)
@@ -299,7 +299,7 @@ func TestAutoPromoteSkipsNegativeResults(t *testing.T) {
 	hid, _ := bm.AddHypothesis("The phantom file privileged-exec.ts does not exist and invalidates the container escape hypothesis", 0.85, nil)
 	_ = bm.UpdateHypothesis(hid, map[string]any{"evidence": "[confirmed] Drone confirmed file not found"})
 
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus).WithExploitAnalyzer(fakeExploitAnalyzer{})
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus).WithExploitAnalyzer(fakeExploitAnalyzer{})
 	engine.autoPromoteHighConfidenceHypotheses(context.Background(), bm)
 
 	if stats := bm.Stats(); stats["total_findings"] != 0 {
@@ -317,7 +317,7 @@ func TestAutoPromoteSkipsLowConfidence(t *testing.T) {
 	hid, _ := bm.AddHypothesis("SQL injection in login handler", 0.30, nil)
 	_ = bm.UpdateHypothesis(hid, map[string]any{"evidence": "[confirmed] Drone confirmed the sink"})
 
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus).WithExploitAnalyzer(fakeExploitAnalyzer{})
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus).WithExploitAnalyzer(fakeExploitAnalyzer{})
 	engine.autoPromoteHighConfidenceHypotheses(context.Background(), bm)
 
 	if stats := bm.Stats(); stats["total_findings"] != 0 {
@@ -337,7 +337,7 @@ func TestAnalyzeAndAdjudicateFinding_RejectsEmptyEvidence(t *testing.T) {
 		t.Fatal("AddFinding failed")
 	}
 
-	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, dir, dir, dir, bus).WithExploitAnalyzer(fakeExploitAnalyzer{})
+	engine := NewEngine(&EngineConfig{}, &fakeRunner{}, NewPlainSkillFS(dir), dir, dir, bus).WithExploitAnalyzer(fakeExploitAnalyzer{})
 	engine.analyzeAndAdjudicateFinding(context.Background(), bm, fid)
 
 	f := bm.GetFinding(fid)

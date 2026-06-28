@@ -24,6 +24,7 @@ type DronePool struct {
 	rootDir      string
 	targetDir    string
 	artifactsDir string
+	skillFS      SkillFS
 	bm           *BlackboardManager
 }
 
@@ -42,6 +43,12 @@ func NewDronePool(capacity int, runner llm.AgentRunner, targetDir, rootDir, arti
 		bm:           bm,
 		bus:          bus,
 	}
+}
+
+// WithSkillFS attaches the SkillFS used to load skill content into drones.
+func (p *DronePool) WithSkillFS(skillFS SkillFS) *DronePool {
+	p.skillFS = skillFS
+	return p
 }
 
 // SetCapacity resizes the pool capacity (applies to future acquires).
@@ -105,7 +112,7 @@ func (p *DronePool) Submit(ctx context.Context, t *DroneTask) error {
 					log.Printf("[drone-pool] task %s UpdateTask running failed: %v", t.ID, err)
 				}
 
-				drone := NewDrone(t.ID, t.Description, t.DroneRole, p.targetDir, p.rootDir, p.artifactsDir)
+				drone := NewDrone(t.ID, t.Description, t.DroneRole, p.targetDir, p.rootDir, p.artifactsDir, p.skillFS)
 				result, err := drone.Execute(ctx, p.runner)
 				if err == nil {
 					log.Printf("[drone-pool] task %s completed (result=%d chars)", t.ID, len(result))

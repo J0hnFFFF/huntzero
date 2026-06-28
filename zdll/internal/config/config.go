@@ -36,11 +36,18 @@ type PathConfig struct {
 	OSVScanner string `mapstructure:"osv_scanner"`
 }
 
+// LicenseConfig holds subscription/license settings.
+type LicenseConfig struct {
+	Key       string `mapstructure:"key"`
+	ServerURL string `mapstructure:"server_url"`
+}
+
 // Config is the top-level configuration.
 type Config struct {
 	LLM      LLMConfig      `mapstructure:"llm"`
 	Analysis AnalysisConfig `mapstructure:"analysis"`
 	Paths    PathConfig     `mapstructure:"paths"`
+	License  LicenseConfig  `mapstructure:"license"`
 }
 
 // Default returns a Config with safe defaults.
@@ -67,6 +74,10 @@ func Default() *Config {
 		Paths: PathConfig{
 			Workspace: filepath.Join(home, "zdll_workspace"),
 			Skills:    "./skills",
+		},
+		License: LicenseConfig{
+			Key:       "",
+			ServerURL: "",
 		},
 	}
 }
@@ -106,6 +117,8 @@ func Load(configFile string) (*Config, error) {
 	v.SetDefault("analysis.sector_threshold_files", cfg.Analysis.SectorThresholdFiles)
 	v.SetDefault("paths.workspace", cfg.Paths.Workspace)
 	v.SetDefault("paths.skills", cfg.Paths.Skills)
+	v.SetDefault("license.key", cfg.License.Key)
+	v.SetDefault("license.server_url", cfg.License.ServerURL)
 
 	_ = v.ReadInConfig() // optional
 	if err := v.Unmarshal(cfg); err != nil {
@@ -198,6 +211,12 @@ paths:
   workspace: ~/zdll_workspace
   skills: ./skills
   # osv_scanner: ""           # empty = auto-download
+
+# Optional subscription/license settings. Required when skills is an encrypted
+# .vault bundle. The public key is normally embedded at build time via ldflags.
+license:
+  key: ""                    # or set ZDLL_LICENSE_KEY / --license
+  server_url: ""             # or set ZDLL_LICENSE_SERVER_URL / --license-server
 `
 		if err := os.WriteFile(path, []byte(sample), 0o600); err != nil {
 			return "", err
