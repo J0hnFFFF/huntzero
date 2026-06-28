@@ -277,7 +277,7 @@ func (d *Drone) buildInitialPrompt() string {
 			base, d.TaskID, d.DroneRole, targetHint, d.TaskDesc,
 		)
 	}
-	return fmt.Sprintf(
+	prompt := fmt.Sprintf(
 		"%s\n\n[DRONE TASK: %s]\nRole: %s\n\n%sTask:\n%s\n\n"+
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"+
 			"IMPORTANT: Before reporting any finding, you MUST first answer these\n"+
@@ -305,6 +305,12 @@ func (d *Drone) buildInitialPrompt() string {
 			"TRACE_TARGET: <file path, function name, or code pattern to investigate>",
 		base, d.TaskID, d.DroneRole, targetHint, d.TaskDesc,
 	)
+	if strings.Contains(d.TaskDesc, "[assumption-test]") {
+		prompt += "\n\nBecause this task verifies a system-model assumption, additionally include:\n" +
+			"ASSUMPTION_CONCLUSION: <valid|violated|unknown>\n" +
+			"ASSUMPTION_EVIDENCE: <code references and reasoning that support the conclusion>\n"
+	}
+	return prompt
 }
 
 func (d *Drone) systemPromptPrefix() string {
@@ -521,10 +527,12 @@ func parseRoundOutput(text string) map[string]any {
 		{"reachable", `(?im)^REACHABLE:\s*(yes|no|unknown)`},
 		{"exploitable", `(?im)^EXPLOITABLE:\s*(yes|no|unknown)`},
 		{"mitigated", `(?im)^MITIGATED:\s*(yes|no|unknown)`},
-		{"evidence", `(?ims)^EVIDENCE:\s*([\s\S]*?)(?:\nDETAIL:|\nTRACE_|$)`},
-		{"detail", `(?ims)^DETAIL:\s*([\s\S]*?)(?:\nTRACE_|$)`},
+		{"evidence", `(?ims)^EVIDENCE:\s*([\s\S]*?)(?:\nDETAIL:|\nTRACE_|\nASSUMPTION_|$)`},
+		{"detail", `(?ims)^DETAIL:\s*([\s\S]*?)(?:\nTRACE_|\nASSUMPTION_|$)`},
 		{"trace_needed", `(?im)^TRACE_NEEDED:\s*(.+?)(?:\n|$)`},
 		{"trace_target", `(?im)^TRACE_TARGET:\s*(.+?)(?:\n|$)`},
+		{"assumption_conclusion", `(?im)^ASSUMPTION_CONCLUSION:\s*(valid|violated|unknown|untested)`},
+		{"assumption_evidence", `(?ims)^ASSUMPTION_EVIDENCE:\s*([\s\S]*?)(?:\nASSUMPTION_|\nFINDING:|\nSEVERITY:|$)`},
 	}
 
 	for _, p := range patterns {

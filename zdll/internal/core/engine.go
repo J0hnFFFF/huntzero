@@ -36,9 +36,12 @@ type Engine struct {
 	bayesian        *BayesianEngine
 	exploitAnalyzer ExploitAnalyzer
 
-	securityExpertBrief     string
-	followedUps             map[string]struct{}
-	devilsAdvocateScheduled map[string]struct{}
+	securityExpertBrief              string
+	followedUps                      map[string]struct{}
+	devilsAdvocateScheduled          map[string]struct{}
+	hypothesisFalsificationScheduled map[string]struct{}
+	assumptionTestsScheduled         map[string]struct{}
+	explorationScheduled             map[string]struct{}
 }
 
 // EngineConfig controls the Cerebrum loop.
@@ -77,17 +80,20 @@ func NewEngine(cfg *EngineConfig, runner llm.AgentRunner, skillsDir, rootDir, ta
 		cfg.Stagnation = 3
 	}
 	return &Engine{
-		cfg:                     cfg,
-		runner:                  runner,
-		skillsDir:               skillsDir,
-		rootDir:                 rootDir,
-		targetDir:               targetDir,
-		bus:                     bus,
-		scanners:                cfg.Scanners,
-		docIntel:                NewDocIntel(targetDir),
-		securityExpertBrief:     loadSecurityExpertBrief(skillsDir),
-		followedUps:             make(map[string]struct{}),
-		devilsAdvocateScheduled: make(map[string]struct{}),
+		cfg:                              cfg,
+		runner:                           runner,
+		skillsDir:                        skillsDir,
+		rootDir:                          rootDir,
+		targetDir:                        targetDir,
+		bus:                              bus,
+		scanners:                         cfg.Scanners,
+		docIntel:                         NewDocIntel(targetDir),
+		securityExpertBrief:              loadSecurityExpertBrief(skillsDir),
+		followedUps:                      make(map[string]struct{}),
+		devilsAdvocateScheduled:          make(map[string]struct{}),
+		hypothesisFalsificationScheduled: make(map[string]struct{}),
+		assumptionTestsScheduled:         make(map[string]struct{}),
+		explorationScheduled:             make(map[string]struct{}),
 	}
 }
 
@@ -181,9 +187,10 @@ func (e *Engine) runSingle(ctx context.Context, bm *BlackboardManager) error {
 
 	// Phase 0: dependency and semantic scans.
 	// Dependency vulnerabilities become confirmed findings. Semantic sink signals
-	// are intentionally kept out of the blackboard: they are noisy heuristics
-	// meant only to seed Cerebrum hypotheses, not to be reported as findings.
+	// and anomaly signals are intentionally kept out of the blackboard: they are
+	// noisy heuristics meant only to seed Cerebrum hypotheses.
 	var semanticSignals []*Finding
+	var anomalySignals []*Finding
 	for _, sc := range e.scanners {
 		findings, err := sc.Scan(ctx, e.targetDir)
 		if err != nil {
@@ -191,8 +198,12 @@ func (e *Engine) runSingle(ctx context.Context, bm *BlackboardManager) error {
 			continue
 		}
 		for _, f := range findings {
-			if f.FindingType == FindingTypeSemantic {
+			switch f.FindingType {
+			case FindingTypeSemantic:
 				semanticSignals = append(semanticSignals, f)
+				continue
+			case FindingTypeAnomalySignal:
+				anomalySignals = append(anomalySignals, f)
 				continue
 			}
 			fid, _ := bm.AddFinding(f.HypothesisID, f.Title, f.Description, f.Severity, f.Evidence,
@@ -272,7 +283,7 @@ func (e *Engine) runSingle(ctx context.Context, bm *BlackboardManager) error {
 			phase = e.domainCtx.CurrentPhase().Name
 		}
 
-		prompt := e.buildSynthesisPrompt(bm, round, phase, docReport, semanticSignals)
+		prompt := e.buildSynthesisPrompt(bm, round, phase, docReport, semanticSignals, anomalySignals)
 		cfg := e.agentConfig(e.targetDir)
 
 		result, err := e.runAgent(ctx, cfg, prompt)
@@ -323,6 +334,19 @@ func (e *Engine) runSingle(ctx context.Context, bm *BlackboardManager) error {
 			e.publish(event.CerebrumStopped, map[string]any{"reason": soft.Reason})
 			break
 		}
+
+		// Before submitting Cerebrum's chosen tasks, dispatch falsification drones
+		// for high-confidence hypotheses that have not yet been actively challenged.
+		// This ensures disproof attempts happen before a hypothesis is promoted.
+		e.scheduleHypothesisFalsification(ctx, bm, dronePool, tasks)
+
+		// Also dispatch verification tasks for assumptions that Cerebrum has been
+		// relying on but has never tested.
+		e.scheduleAssumptionTests(ctx, bm, dronePool, tasks)
+
+		// Periodically dispatch open-ended exploration drones to prevent the
+		// search from collapsing too early onto a single line of reasoning.
+		e.spawnExplorationDrones(ctx, bm, dronePool)
 
 		log.Printf("[cerebrum] submitting %d drone task(s) (total_tasks=%d, max_tasks=%d)", len(tasks), bm.Snapshot().TotalTasks, e.cfg.MaxTasks)
 		for _, t := range tasks {
@@ -469,7 +493,7 @@ func (e *Engine) agentConfig(workDir string) llm.AgentConfig {
 }
 
 // buildSynthesisPrompt creates a phase-aware prompt for the Cerebrum agent.
-func (e *Engine) buildSynthesisPrompt(bm *BlackboardManager, round int, phase string, report *DocIntelReport, semanticSignals []*Finding) string {
+func (e *Engine) buildSynthesisPrompt(bm *BlackboardManager, round int, phase string, report *DocIntelReport, semanticSignals, anomalySignals []*Finding) string {
 	stats := bm.Stats()
 	var sb strings.Builder
 
@@ -495,9 +519,20 @@ func (e *Engine) buildSynthesisPrompt(bm *BlackboardManager, round int, phase st
 	fmt.Fprintf(&sb, "State: %d hypotheses, %d findings, %d tasks executed\n\n",
 		stats["total_hypotheses"], stats["total_findings"], stats["tasks_executed"])
 
+	if model := bm.Snapshot().SystemModel; model != nil {
+		if sec := systemModelSummary(model); sec != "" {
+			sb.WriteString(sec)
+			sb.WriteString("\n")
+		}
+	}
+
 	if e.domainCtx != nil {
 		if phaseSec := e.domainCtx.CurrentPhaseSection(); phaseSec != "" {
 			sb.WriteString(phaseSec)
+			sb.WriteString("\n")
+		}
+		if analogy := e.domainCtx.AnalogyPrompts(); analogy != "" {
+			sb.WriteString(analogy)
 			sb.WriteString("\n")
 		}
 	}
@@ -517,6 +552,14 @@ func (e *Engine) buildSynthesisPrompt(bm *BlackboardManager, round int, phase st
 	if semSummary := e.semanticSignalSummary(semanticSignals); semSummary != "" {
 		sb.WriteString("## Semantic Signals\n")
 		sb.WriteString(semSummary)
+		sb.WriteString("\n")
+	}
+
+	if anomalySummary := anomalySignalSummary(anomalySignals); anomalySummary != "" {
+		sb.WriteString("## Anomaly Signals\n")
+		sb.WriteString("These are NOT findings. They are observations that feel wrong or inconsistent. " +
+			"Use them as starting points for abductive reasoning, not conclusions.\n")
+		sb.WriteString(anomalySummary)
 		sb.WriteString("\n")
 	}
 
@@ -617,6 +660,88 @@ func (e *Engine) semanticSignalSummary(semanticSignals []*Finding) string {
 	return strings.Join(lines[:min(len(lines), 10)], "\n") + "\n"
 }
 
+// anomalySignalSummary formats anomaly signals for the Cerebrum prompt.
+// Signals are ranked by curiosity score so the most provocative anomalies
+// appear first.
+func anomalySignalSummary(anomalySignals []*Finding) string {
+	if len(anomalySignals) == 0 {
+		return ""
+	}
+	ranked := make([]*Finding, len(anomalySignals))
+	copy(ranked, anomalySignals)
+	sort.Slice(ranked, func(i, j int) bool {
+		return ranked[i].Confidence > ranked[j].Confidence
+	})
+	var lines []string
+	for _, f := range ranked[:min(len(ranked), 10)] {
+		ev := truncateString(f.Evidence, 180)
+		lines = append(lines, fmt.Sprintf("- [score %.2f] %s: %s", f.Confidence, f.Title, ev))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// systemModelSummary formats the current system model for the Cerebrum prompt.
+// It is intentionally concise to avoid bloating the context window.
+func systemModelSummary(model *SystemModel) string {
+	if model == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## System Model (update if your understanding changed)\n")
+	if len(model.TrustBoundaries) > 0 {
+		b.WriteString("### Trust Boundaries\n")
+		for _, x := range model.TrustBoundaries {
+			fmt.Fprintf(&b, "- %s: %s -> %s (%s)\n", x.Name, x.UntrustedSide, x.TrustedSide, x.Description)
+		}
+	}
+	if len(model.DataFlows) > 0 {
+		b.WriteString("### Data Flows\n")
+		for _, x := range model.DataFlows {
+			fmt.Fprintf(&b, "- %s: %s -> %s (%s)\n", x.Name, x.Source, strings.Join(x.Sinks, ", "), x.Description)
+		}
+	}
+	if len(model.Invariants) > 0 {
+		b.WriteString("### Invariants\n")
+		for _, x := range model.Invariants {
+			mark := "untested"
+			if x.Tested {
+				mark = "tested"
+			}
+			fmt.Fprintf(&b, "- [%s] %s\n", mark, x.Statement)
+		}
+	}
+	if len(model.OverconfidenceZones) > 0 {
+		b.WriteString("### Overconfidence Zones\n")
+		for _, x := range model.OverconfidenceZones {
+			fmt.Fprintf(&b, "- %s\n", x)
+		}
+	}
+	if len(model.Anomalies) > 0 {
+		b.WriteString("### Anomalies\n")
+		for _, x := range model.Anomalies {
+			fmt.Fprintf(&b, "- %s\n", x)
+		}
+	}
+	if len(model.UntestedAssumptions) > 0 {
+		b.WriteString("### Assumptions (tested + untested)\n")
+		for _, a := range model.UntestedAssumptions {
+			status := "untested"
+			if a.Tested {
+				status = a.Conclusion
+				if status == "" {
+					status = "tested"
+				}
+			}
+			fmt.Fprintf(&b, "- [%s] %s", status, a.Text)
+			if a.Tested && len(a.TestedBy) > 0 {
+				fmt.Fprintf(&b, " (%s)", strings.Join(a.TestedBy, ", "))
+			}
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
 func (e *Engine) dispatchedTasksSummary(bm *BlackboardManager) string {
 	snap := bm.Snapshot()
 	var relevant []*DroneTask
@@ -700,9 +825,11 @@ func (e *Engine) parseAndApply(ctx context.Context, bm *BlackboardManager, outpu
 				Confidence  float64 `json:"confidence"`
 				Evidence    string  `json:"evidence"`
 			} `json:"findings"`
-			PhaseComplete  bool   `json:"phase_complete"`
-			Complete       bool   `json:"is_complete"`
-			CompleteReason string `json:"complete_reason"`
+			SystemModel         *SystemModel `json:"system_model"`
+			UntestedAssumptions []string     `json:"untested_assumptions"`
+			PhaseComplete       bool         `json:"phase_complete"`
+			Complete            bool         `json:"is_complete"`
+			CompleteReason      string       `json:"complete_reason"`
 		}
 		if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
 			log.Printf("[cerebrum] JSON unmarshal failed: %v", err)
@@ -727,6 +854,25 @@ func (e *Engine) parseAndApply(ctx context.Context, bm *BlackboardManager, outpu
 					hMap[claim[:minInt(len(claim), 40)]] = hid
 					hMap[claim[:minInt(len(claim), 30)]] = hid
 				}
+			}
+
+			// Persist Cerebrum's evolving system model and untested assumptions.
+			// The model is cumulative: new entries are merged, existing tested
+			// assumptions are preserved.
+			model := parsed.SystemModel
+			if model == nil {
+				model = NewSystemModel()
+			}
+			for i := range model.UntestedAssumptions {
+				if model.UntestedAssumptions[i].RoundCreated == 0 {
+					model.UntestedAssumptions[i].RoundCreated = bm.Snapshot().Round
+				}
+			}
+			for _, text := range parsed.UntestedAssumptions {
+				model.UntestedAssumptions = append(model.UntestedAssumptions, Assumption{Text: text})
+			}
+			if err := bm.UpdateSystemModel(model); err != nil {
+				e.publish(event.Error, map[string]any{"source": "system-model", "message": err.Error()})
 			}
 
 			for _, f := range parsed.Findings {
@@ -1157,6 +1303,28 @@ func (e *Engine) integrateResults(ctx context.Context, bm *BlackboardManager) {
 			continue
 		}
 
+		// Falsification tasks are handled separately: they do not create new
+		// findings. They either strengthen the hypothesis (disproof failed) or
+		// weaken/discredit it (disproof succeeded).
+		if t.Falsification {
+			e.integrateFalsificationResult(bm, t, h, parsed)
+			_ = bm.MarkTaskIntegrated(t.ID)
+			continue
+		}
+
+		// Assumption verification tasks do not create findings. They record the
+		// drone's conclusion (valid/violated/unknown) back into the system model
+		// so Cerebrum can stop relying on disproven assumptions.
+		if t.TargetAssumptionID != "" {
+			conclusion := util.StringValue(parsed["assumption_conclusion"])
+			if conclusion == "" {
+				conclusion = "unknown"
+			}
+			_ = bm.SetAssumptionConclusion(t.TargetAssumptionID, conclusion, t.ID)
+			_ = bm.MarkTaskIntegrated(t.ID)
+			continue
+		}
+
 		// Honor the drone's own exploitability screening. If the drone concluded
 		// the issue is not reachable, not exploitable, or already mitigated,
 		// treat this as a negative result even if a SEVERITY line was emitted.
@@ -1307,6 +1475,43 @@ func (e *Engine) applyNegativeResult(bm *BlackboardManager, t *DroneTask, h *Hyp
 			negCount, posCount, newConf,
 		))
 	}
+}
+
+// integrateFalsificationResult processes the output of a devils-advocate task
+// that was dispatched to actively DISPROVE a hypothesis. If the drone finds a
+// compelling reason the hypothesis is invalid (not reachable, not exploitable,
+// or already mitigated), the hypothesis is penalized. Otherwise it gets a small
+// confidence boost and a passing evidence tag.
+func (e *Engine) integrateFalsificationResult(bm *BlackboardManager, t *DroneTask, h *HypothesisNode, parsed map[string]any) {
+	attempts := h.FalsificationAttempts + 1
+	droneConf := util.FloatValue(parsed["confidence"])
+
+	if screeningIndicatesFalsePositive(parsed) {
+		e.applyNegativeResult(bm, t, h, droneConf)
+		_ = bm.UpdateHypothesis(h.ID, map[string]any{
+			"falsification_attempts": attempts,
+			"evidence":               fmt.Sprintf("[falsification-disproven] attempt %d by %s", attempts, t.ID),
+		})
+		return
+	}
+
+	// The hypothesis survived an active disproof attempt.
+	newConf := clampFloat(h.Confidence+0.03, 0, 0.95)
+	status := h.Status
+	switch {
+	case newConf >= 0.85:
+		status = HypothesisConfirmed
+	case newConf >= 0.6:
+		status = HypothesisSuspected
+	default:
+		status = HypothesisActive
+	}
+	_ = bm.UpdateHypothesis(h.ID, map[string]any{
+		"confidence":             newConf,
+		"status":                 status,
+		"falsification_attempts": attempts,
+		"evidence":               fmt.Sprintf("[falsification-survived] attempt %d by %s", attempts, t.ID),
+	})
 }
 
 func (e *Engine) rejectActiveFindingsForHypothesis(bm *BlackboardManager, hypothesisID, reason string) {
@@ -1922,6 +2127,251 @@ func (e *Engine) scheduleDevilsAdvocate(ctx context.Context, bm *BlackboardManag
 			"text": fmt.Sprintf("[devils-advocate] spawned challenge task for %s finding: %s", f.Severity, f.Title),
 		})
 	}
+}
+
+// scheduleHypothesisFalsification dispatches devils-advocate drones for live
+// hypotheses that are confident enough to promote but have not yet been actively
+// challenged. The goal is to disprove the hypothesis before it becomes a finding.
+func (e *Engine) scheduleHypothesisFalsification(ctx context.Context, bm *BlackboardManager, pool *DronePool, cerebrumTasks []*DroneTask) {
+	snap := bm.Snapshot()
+	if snap.TotalTasks >= e.cfg.MaxTasks {
+		return
+	}
+
+	// Hypotheses that already have a task dispatched this round do not need a
+	// separate falsification pass right now.
+	addressed := make(map[string]struct{}, len(cerebrumTasks))
+	for _, t := range cerebrumTasks {
+		if t.HypothesisID != "" {
+			addressed[t.HypothesisID] = struct{}{}
+		}
+	}
+
+	const maxPerRound = 2
+	scheduled := 0
+	for _, h := range snap.Hypotheses {
+		if h.Status == HypothesisConfirmed || h.Status == HypothesisDiscarded {
+			continue
+		}
+		if h.Confidence < 0.6 {
+			continue
+		}
+		if h.FalsificationAttempts >= 2 {
+			continue
+		}
+		if _, ok := e.hypothesisFalsificationScheduled[h.ID]; ok {
+			continue
+		}
+		if _, ok := addressed[h.ID]; ok {
+			continue
+		}
+		if snap.TotalTasks >= e.cfg.MaxTasks {
+			break
+		}
+
+		desc := fmt.Sprintf("[falsification] Hypothesis: %s\n\n"+
+			"Your job is to actively DISPROVE this hypothesis. Investigate the same code paths and look for:\n"+
+			"- upstream validation that prevents exploitation\n"+
+			"- the code path is not reachable by untrusted input\n"+
+			"- default configuration, sandbox, or runtime protections that mitigate it\n\n"+
+			"Return REACHABLE/EXPLOITABLE/MITIGATED screening. If you cannot disprove, explain why the hypothesis remains plausible.",
+			h.Description)
+		tid, err := bm.AddTask(h.ID, desc, "devils-advocate")
+		if err != nil {
+			continue
+		}
+		_ = bm.MarkTaskFalsification(tid)
+		e.hypothesisFalsificationScheduled[h.ID] = struct{}{}
+		if pool != nil {
+			if task, ok := bm.Snapshot().Tasks[tid]; ok {
+				_ = pool.Submit(ctx, task)
+			}
+		}
+		e.publish(event.CerebrumThought, map[string]any{
+			"text": fmt.Sprintf("[falsification] spawned disproof task for hypothesis %s", h.ID),
+		})
+		scheduled++
+		if scheduled >= maxPerRound {
+			break
+		}
+	}
+}
+
+// scheduleAssumptionTests dispatches drones to investigate untested assumptions
+// from the system model. This prevents Cerebrum from relying indefinitely on
+// assumptions it has never verified.
+func (e *Engine) scheduleAssumptionTests(ctx context.Context, bm *BlackboardManager, pool *DronePool, cerebrumTasks []*DroneTask) {
+	snap := bm.Snapshot()
+	if snap.SystemModel == nil || snap.TotalTasks >= e.cfg.MaxTasks {
+		return
+	}
+
+	// If Cerebrum already generated a task that names an assumption, count it as
+	// addressed for this round.
+	addressed := make(map[string]struct{}, len(cerebrumTasks))
+	for _, t := range cerebrumTasks {
+		if t.TargetAssumptionID != "" {
+			addressed[t.TargetAssumptionID] = struct{}{}
+		}
+	}
+
+	holderID := bm.AssumptionHolderID()
+	const maxPerRound = 2
+	scheduled := 0
+	for _, a := range snap.SystemModel.UntestedAssumptions {
+		if a.Tested {
+			continue
+		}
+		if a.Text == "" {
+			continue
+		}
+		if _, ok := e.assumptionTestsScheduled[a.ID]; ok {
+			continue
+		}
+		if _, ok := addressed[a.ID]; ok {
+			continue
+		}
+		if snap.TotalTasks >= e.cfg.MaxTasks {
+			break
+		}
+
+		desc := fmt.Sprintf("[assumption-test] Assumption: %s\n\n"+
+			"Verify whether this assumption holds. Investigate the relevant code paths and return:\n"+
+			"- VALID: the assumption is true\n"+
+			"- VIOLATED: the assumption is false (explain what you found)\n"+
+			"- UNKNOWN: not enough evidence\n\n"+
+			"Provide concrete code references.",
+			a.Text)
+		tid, err := bm.AddTask(holderID, desc, "evidence-collector")
+		if err != nil {
+			continue
+		}
+		_ = bm.MarkTaskTargetAssumption(tid, a.ID)
+		e.assumptionTestsScheduled[a.ID] = struct{}{}
+		if pool != nil {
+			if task, ok := bm.Snapshot().Tasks[tid]; ok {
+				_ = pool.Submit(ctx, task)
+			}
+		}
+		e.publish(event.CerebrumThought, map[string]any{
+			"text": fmt.Sprintf("[assumption-test] spawned verification task for assumption %s", a.ID),
+		})
+		scheduled++
+		if scheduled >= maxPerRound {
+			break
+		}
+	}
+}
+
+// spawnExplorationDrones periodically dispatches open-ended reconnaissance tasks
+// to prevent early convergence. The drone is asked to examine a high-value area
+// and report any observation that violates the system's basic security
+// assumptions, without being told what vulnerability class to look for.
+func (e *Engine) spawnExplorationDrones(ctx context.Context, bm *BlackboardManager, pool *DronePool) {
+	snap := bm.Snapshot()
+	if snap.TotalTasks >= e.cfg.MaxTasks {
+		return
+	}
+
+	// Count live (non-terminal) hypotheses.
+	active := 0
+	for _, h := range snap.Hypotheses {
+		switch h.Status {
+		case HypothesisPending, HypothesisActive, HypothesisSuspected:
+			active++
+		}
+	}
+
+	round := snap.Round
+	// Trigger every 5 rounds, or earlier if the search space seems to have
+	// collapsed to very few live hypotheses.
+	if round%5 != 0 && !(round > 3 && active < 3) {
+		return
+	}
+
+	targets := e.pickExplorationTargets()
+	if len(targets) == 0 {
+		return
+	}
+
+	const maxPerRound = 1
+	scheduled := 0
+	holderID := bm.AssumptionHolderID()
+	for _, target := range targets {
+		if _, ok := e.explorationScheduled[target]; ok {
+			continue
+		}
+		if snap.TotalTasks >= e.cfg.MaxTasks {
+			break
+		}
+
+		desc := fmt.Sprintf("[exploration] Examine %s with fresh eyes.\n\n"+
+			"Do not look for a specific vulnerability type. Answer these questions:\n"+
+			"1. What is this module's core security assumption?\n"+
+			"2. What input does it receive from less-trusted code?\n"+
+			"3. Is there anything that violates the system's basic trust model?\n\n"+
+			"Return only concrete observations with code references. If nothing stands out, say so clearly.",
+			target)
+		tid, err := bm.AddTask(holderID, desc, "evidence-collector")
+		if err != nil {
+			continue
+		}
+		_ = bm.MarkTaskExplorationTarget(tid, target)
+		e.explorationScheduled[target] = struct{}{}
+		if pool != nil {
+			if task, ok := bm.Snapshot().Tasks[tid]; ok {
+				_ = pool.Submit(ctx, task)
+			}
+		}
+		e.publish(event.CerebrumThought, map[string]any{
+			"text": fmt.Sprintf("[exploration] spawned open-ended recon task for %s", target),
+		})
+		scheduled++
+		if scheduled >= maxPerRound {
+			break
+		}
+	}
+}
+
+// pickExplorationTargets returns a list of high-value directories or files in
+// the target project that are worth examining with an open-ended lens.
+func (e *Engine) pickExplorationTargets() []string {
+	entries, err := os.ReadDir(e.targetDir)
+	if err != nil {
+		return nil
+	}
+	highValue := []string{
+		"main", "app", "server", "api", "auth", "login", "upload",
+		"parse", "deserialize", "decode", "handler", "router", "middleware",
+		"config", "cmd", "internal", "pkg", "service", "controller",
+	}
+
+	var matches []string
+	for _, entry := range entries {
+		name := strings.ToLower(entry.Name())
+		for _, hv := range highValue {
+			if strings.Contains(name, hv) {
+				matches = append(matches, entry.Name())
+				break
+			}
+		}
+	}
+	if len(matches) > 0 {
+		return matches
+	}
+	// Fallback: return the first few non-hidden entries so exploration still
+	// happens on projects without obvious high-value names.
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		matches = append(matches, name)
+		if len(matches) >= 3 {
+			break
+		}
+	}
+	return matches
 }
 
 // recordTerminalOutcomes feeds confirmed/discarded hypotheses into the Bayesian

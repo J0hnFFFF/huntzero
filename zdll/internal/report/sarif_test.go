@@ -116,3 +116,34 @@ func TestSARIFRenderer_Empty(t *testing.T) {
 		t.Errorf("results = %d, want 0", len(doc.Runs[0].Results))
 	}
 }
+
+func TestSARIFRenderer_SystemModel(t *testing.T) {
+	bb := core.NewBlackboard("local")
+	bb.SystemModel.TrustBoundaries = []core.Boundary{
+		{ID: "b1", Name: "HTTP", TrustedSide: "app", UntrustedSide: "internet", Description: "frontier"},
+	}
+	bb.SystemModel.UntestedAssumptions = []core.Assumption{
+		{ID: "A-1", Text: "only admins reach /admin", Conclusion: core.AssumptionConclusionValid, Tested: true, TestedBy: []string{"T-1"}},
+	}
+
+	r := &SARIFRenderer{}
+	data, err := r.Render(bb, bb.Target, time.Second)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	var doc sarifDocument
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	run := doc.Runs[0]
+	if run.Properties == nil {
+		t.Fatal("expected run properties")
+	}
+	sm, ok := run.Properties["system_model"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected system_model object, got %T", run.Properties["system_model"])
+	}
+	if _, ok := sm["trust_boundaries"]; !ok {
+		t.Error("expected trust_boundaries in system_model")
+	}
+}

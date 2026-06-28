@@ -111,6 +111,67 @@ func (dc *DomainContext) TerrainSection() string {
 	return dc.Terrain + "\n"
 }
 
+// AnalogyPrompts returns cross-domain analogy questions for the active domains.
+// The goal is to encourage Cerebrum to transfer first-principles thinking from
+// one domain to another, broadening the search without hardcoding vulnerability
+// patterns.
+func (dc *DomainContext) AnalogyPrompts() string {
+	if dc == nil || len(dc.Domains) < 2 {
+		return ""
+	}
+	active := make([]string, 0, len(dc.Domains))
+	for _, d := range dc.Domains {
+		if d != "security-expert" {
+			active = append(active, d)
+		}
+	}
+	if len(active) < 2 {
+		return ""
+	}
+	sort.Strings(active)
+
+	var prompts []string
+	for i := 0; i < len(active) && len(prompts) < 2; i++ {
+		for j := i + 1; j < len(active) && len(prompts) < 2; j++ {
+			if p := analogyForPair(active[i], active[j]); p != "" {
+				prompts = append(prompts, p)
+			}
+		}
+	}
+	if len(prompts) == 0 {
+		return ""
+	}
+	return "## Cross-Domain Analogy Lens\n" +
+		"Consider these questions to transfer first-principles reasoning across domains. " +
+		"If an analogy does not apply to this project, ignore it.\n\n" +
+		strings.Join(prompts, "\n\n") + "\n"
+}
+
+func analogyForPair(a, b string) string {
+	key := a + "," + b
+	if p, ok := analogyPrompts[key]; ok {
+		return p
+	}
+	// Generic fallback: ask the model to look for trust-boundary crossings that
+	// both domains share.
+	return fmt.Sprintf("Both %s and %s rely on trust boundaries. Where does %s assume something is trusted in a way that %s would question?", a, b, b, a)
+}
+
+var analogyPrompts = map[string]string{
+	"ai-agent,web": "Web's first principle is request-as-proxy uncertainty: a request carries identity but not provable intent. " +
+		"Does this AI agent face an analogous problem where an authenticated session issues a tool call, but the system cannot confirm it reflects the user's true intent?",
+	"data-parser,web": "Web's first principle is the semantic gap between input text and internal state. " +
+		"Does this parser interpret the same bytes in multiple ways between validation and execution, creating a parser-differential opportunity?",
+	"binary,data-parser": "Parser differentials often lead to memory corruption when one layer accepts input that another layer misinterprets. " +
+		"Where does this binary/parser pair make inconsistent assumptions about format validity?",
+	"infra,supply-chain": "Both infra and supply-chain rely on trust chains: source code, build artifacts, deployment configs. " +
+		"Where could an attacker insert themselves between these links without detection?",
+	"storage-engine,web": "Web's stateless amnesia forces the server to reconstruct state from each request. " +
+		"Does this storage engine reconstruct state from untrusted input in a way that races or stale reads could violate?",
+	"desktop,web": "Web browsers enforce same-origin isolation. " +
+		"Does this desktop application have equivalent isolation between privileged and unprivileged contexts, or can one context forge instructions to the other?",
+}
+
 // CurrentPhaseSection returns formatted instructions for the active phase.
 func (dc *DomainContext) CurrentPhaseSection() string {
 	p := dc.CurrentPhase()

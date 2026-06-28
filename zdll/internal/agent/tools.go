@@ -41,6 +41,7 @@ func NewToolSet(workDir string) *ToolSet {
 		&writeFileTool{workDir: workDir},
 		&grepTool{workDir: workDir},
 		&globTool{workDir: workDir},
+		&pythonAnalyzeTool{workDir: workDir},
 		&fetchURLTool{},
 	}
 	return t
@@ -577,4 +578,93 @@ func (t *fetchURLTool) InvokableRun(ctx context.Context, argumentsInJSON string,
 		return "", err
 	}
 	return string(body), nil
+}
+
+// pythonAnalyzeTool lets a drone generate and run a short Python script to
+// answer a specific code-analysis question (e.g. trace data flow, count
+// callers, parse an AST, simulate input). The script is executed inside the
+// task sandbox with a tight timeout.
+type pythonAnalyzeTool struct {
+	workDir string
+}
+
+func (t *pythonAnalyzeTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{
+		Name: "python_analyze",
+		Desc: "Generate and execute a short Python script to answer a specific local analysis question. " +
+			"Useful for: parsing ASTs, counting call sites, simulating inputs, comparing strings, building small reachability checks. " +
+			"Do NOT use this for network requests or subprocess calls; use bash/fetch_url for those.",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"script": {
+				Type:     schema.String,
+				Desc:     "Full Python script source to execute",
+				Required: true,
+			},
+			"timeout_seconds": {
+				Type:     schema.Integer,
+				Desc:     "Maximum time to allow the script to run (default 60, max 300)",
+				Required: false,
+			},
+		}),
+	}, nil
+}
+
+var unsafeScriptPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)import\s+(socket|urllib|requests|httpx|subprocess|paramiko|fabric)`),
+	regexp.MustCompile(`(?i)os\.system|subprocess\.|os\.popen|exec\s*\(|eval\s*\(`),
+}
+
+func (t *pythonAnalyzeTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
+	var args struct {
+		Script         string `json:"script"`
+		TimeoutSeconds int    `json:"timeout_seconds"`
+	}
+	if err := json.Unmarshal([]byte(argumentsInJSON), &args); err != nil {
+		return "", fmt.Errorf("parse args: %w", err)
+	}
+	args.Script = strings.TrimSpace(args.Script)
+	if args.Script == "" {
+		return "", fmt.Errorf("empty script")
+	}
+	for _, re := range unsafeScriptPatterns {
+		if re.MatchString(args.Script) {
+			return "", fmt.Errorf("script blocked for safety: matches %s", re.String())
+		}
+	}
+
+	if args.TimeoutSeconds <= 0 {
+		args.TimeoutSeconds = 60
+	}
+	if args.TimeoutSeconds > 300 {
+		args.TimeoutSeconds = 300
+	}
+
+	scriptPath := filepath.Join(t.workDir, fmt.Sprintf(".analyze_%d.py", time.Now().UnixNano()))
+	if err := os.WriteFile(scriptPath, []byte(args.Script), 0o600); err != nil {
+		return "", fmt.Errorf("write script: %w", err)
+	}
+	defer os.Remove(scriptPath)
+
+	// Prefer `python` when available; many Windows installs only provide that.
+	py := "python"
+	if _, err := exec.LookPath("python"); err != nil {
+		py = "python3"
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(args.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, py, scriptPath)
+	cmd.Dir = t.workDir
+	cmd.Env = append(os.Environ(), "PYTHONDONTWRITEBYTECODE=1")
+
+	out, err := cmd.CombinedOutput()
+	result := string(out)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return result + "\n[timeout]", nil
+		}
+		return result + fmt.Sprintf("\n[error] %v", err), nil
+	}
+	return result, nil
 }

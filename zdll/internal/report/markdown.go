@@ -37,6 +37,13 @@ func (r *MarkdownRenderer) Render(bb *core.Blackboard, target string, elapsed ti
 		fmt.Fprintf(&b, "| %s | %d |\n", strings.ReplaceAll(k, "_", " "), data.Summary[k])
 	}
 
+	fmt.Fprintf(&b, "\n## System Model\n\n")
+	if data.SystemModel == nil || systemModelIsEmpty(data.SystemModel) {
+		fmt.Fprintf(&b, "No system model recorded.\n\n")
+	} else {
+		b.Write(systemModelSection(data.SystemModel))
+	}
+
 	fmt.Fprintf(&b, "\n## Findings\n\n")
 	if len(data.Findings) == 0 {
 		fmt.Fprintf(&b, "No findings confirmed.\n\n")
@@ -67,6 +74,75 @@ func (r *MarkdownRenderer) Render(bb *core.Blackboard, target string, elapsed ti
 	}
 
 	return b.Bytes(), nil
+}
+
+func systemModelIsEmpty(m *core.SystemModel) bool {
+	return len(m.TrustBoundaries) == 0 && len(m.DataFlows) == 0 && len(m.Invariants) == 0 &&
+		len(m.OverconfidenceZones) == 0 && len(m.Anomalies) == 0 && len(m.UntestedAssumptions) == 0
+}
+
+func systemModelSection(m *core.SystemModel) []byte {
+	var b bytes.Buffer
+	if len(m.TrustBoundaries) > 0 {
+		fmt.Fprintf(&b, "### Trust Boundaries\n\n")
+		for _, x := range m.TrustBoundaries {
+			fmt.Fprintf(&b, "- **%s**: %s → %s  \n  %s\n", x.Name, x.UntrustedSide, x.TrustedSide, x.Description)
+		}
+		b.WriteString("\n")
+	}
+	if len(m.DataFlows) > 0 {
+		fmt.Fprintf(&b, "### Data Flows\n\n")
+		for _, x := range m.DataFlows {
+			fmt.Fprintf(&b, "- **%s**: %s → %s  \n  %s\n", x.Name, x.Source, strings.Join(x.Sinks, ", "), x.Description)
+		}
+		b.WriteString("\n")
+	}
+	if len(m.Invariants) > 0 {
+		fmt.Fprintf(&b, "### Invariants\n\n")
+		for _, x := range m.Invariants {
+			status := "untested"
+			if x.Tested {
+				status = "tested"
+			}
+			fmt.Fprintf(&b, "- [%s] %s\n", status, x.Statement)
+		}
+		b.WriteString("\n")
+	}
+	if len(m.OverconfidenceZones) > 0 {
+		fmt.Fprintf(&b, "### Overconfidence Zones\n\n")
+		for _, x := range m.OverconfidenceZones {
+			fmt.Fprintf(&b, "- %s\n", x)
+		}
+		b.WriteString("\n")
+	}
+	if len(m.Anomalies) > 0 {
+		fmt.Fprintf(&b, "### Anomalies\n\n")
+		for _, x := range m.Anomalies {
+			fmt.Fprintf(&b, "- %s\n", x)
+		}
+		b.WriteString("\n")
+	}
+	if len(m.UntestedAssumptions) > 0 {
+		fmt.Fprintf(&b, "### Assumptions\n\n")
+		fmt.Fprintf(&b, "| Status | Assumption | Verified by |\n")
+		fmt.Fprintf(&b, "|--------|------------|-------------|\n")
+		for _, a := range m.UntestedAssumptions {
+			status := "untested"
+			if a.Tested {
+				status = a.Conclusion
+				if status == "" {
+					status = "tested"
+				}
+			}
+			verifiedBy := "—"
+			if len(a.TestedBy) > 0 {
+				verifiedBy = strings.Join(a.TestedBy, ", ")
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s |\n", status, a.Text, verifiedBy)
+		}
+		b.WriteString("\n")
+	}
+	return b.Bytes()
 }
 
 var fenceRe = regexp.MustCompile("`{3,}")

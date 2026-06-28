@@ -21,6 +21,9 @@ const (
 	CerebrumCriticReviewed = "cerebrum_critic_reviewed"
 	CerebrumThought        = "cerebrum_thought"
 
+	SystemModelUpdated = "system_model_updated"
+	AssumptionTested   = "assumption_tested"
+
 	HypothesisGenerated = "hypothesis_generated"
 	HypothesisUpdated   = "hypothesis_updated"
 

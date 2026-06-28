@@ -72,6 +72,7 @@ func (f *Finding) Clone() *Finding {
 		PoCOutput:      cloneString(f.PoCOutput),
 		PoCVerifiedAt:  cloneFloat64(f.PoCVerifiedAt),
 		Prerequisites:  f.Prerequisites.Clone(),
+		Confidence:     f.Confidence,
 		FindingType:    f.FindingType,
 		CVEID:          f.CVEID,
 		PackageName:    f.PackageName,
@@ -82,21 +83,52 @@ func (f *Finding) Clone() *Finding {
 	}
 }
 
+// Clone returns a deep copy of the system model.
+func (m *SystemModel) Clone() *SystemModel {
+	if m == nil {
+		return nil
+	}
+	boundaries := make([]Boundary, len(m.TrustBoundaries))
+	copy(boundaries, m.TrustBoundaries)
+	flows := make([]DataFlow, len(m.DataFlows))
+	copy(flows, m.DataFlows)
+	invariants := make([]Invariant, len(m.Invariants))
+	copy(invariants, m.Invariants)
+	zones := make([]string, len(m.OverconfidenceZones))
+	copy(zones, m.OverconfidenceZones)
+	anomalies := make([]string, len(m.Anomalies))
+	copy(anomalies, m.Anomalies)
+	assumptions := make([]Assumption, len(m.UntestedAssumptions))
+	copy(assumptions, m.UntestedAssumptions)
+	for i := range assumptions {
+		assumptions[i].TestedBy = cloneStringSlice(assumptions[i].TestedBy)
+	}
+	return &SystemModel{
+		TrustBoundaries:     boundaries,
+		DataFlows:           flows,
+		Invariants:          invariants,
+		OverconfidenceZones: zones,
+		Anomalies:           anomalies,
+		UntestedAssumptions: assumptions,
+	}
+}
+
 // Clone returns a deep copy of the hypothesis node.
 func (h *HypothesisNode) Clone() *HypothesisNode {
 	if h == nil {
 		return nil
 	}
 	return &HypothesisNode{
-		ID:          h.ID,
-		Description: h.Description,
-		Confidence:  h.Confidence,
-		Status:      h.Status,
-		Tasks:       cloneStringSlice(h.Tasks),
-		Evidence:    cloneStringSlice(h.Evidence),
-		ParentID:    cloneString(h.ParentID),
-		CreatedAt:   h.CreatedAt,
-		Polarity:    h.Polarity,
+		ID:                    h.ID,
+		Description:           h.Description,
+		Confidence:            h.Confidence,
+		Status:                h.Status,
+		Tasks:                 cloneStringSlice(h.Tasks),
+		Evidence:              cloneStringSlice(h.Evidence),
+		ParentID:              cloneString(h.ParentID),
+		CreatedAt:             h.CreatedAt,
+		Polarity:              h.Polarity,
+		FalsificationAttempts: h.FalsificationAttempts,
 	}
 }
 
@@ -106,16 +138,19 @@ func (t *DroneTask) Clone() *DroneTask {
 		return nil
 	}
 	return &DroneTask{
-		ID:           t.ID,
-		HypothesisID: t.HypothesisID,
-		Description:  t.Description,
-		Status:       t.Status,
-		DroneRole:    t.DroneRole,
-		Result:       cloneString(t.Result),
-		Error:        cloneString(t.Error),
-		CreatedAt:    t.CreatedAt,
-		CompletedAt:  cloneFloat64(t.CompletedAt),
-		Integrated:   t.Integrated,
+		ID:                 t.ID,
+		HypothesisID:       t.HypothesisID,
+		Description:        t.Description,
+		Status:             t.Status,
+		DroneRole:          t.DroneRole,
+		Result:             cloneString(t.Result),
+		Error:              cloneString(t.Error),
+		CreatedAt:          t.CreatedAt,
+		CompletedAt:        cloneFloat64(t.CompletedAt),
+		Integrated:         t.Integrated,
+		Falsification:      t.Falsification,
+		TargetAssumptionID: t.TargetAssumptionID,
+		ExplorationTarget:  t.ExplorationTarget,
 	}
 }
 
@@ -133,6 +168,7 @@ func (bb *Blackboard) Clone() *Blackboard {
 		Hypotheses:   make(map[string]*HypothesisNode, len(bb.Hypotheses)),
 		Tasks:        make(map[string]*DroneTask, len(bb.Tasks)),
 		Findings:     make([]*Finding, len(bb.Findings)),
+		SystemModel:  bb.SystemModel.Clone(),
 		Round:        bb.Round,
 		TotalTasks:   bb.TotalTasks,
 		CreatedAt:    bb.CreatedAt,

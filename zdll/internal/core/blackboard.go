@@ -49,6 +49,11 @@ func (bm *BlackboardManager) Init(target string) error {
 			for _, h := range bm.bb.Hypotheses {
 				bm.bloom.Add(h.Description)
 			}
+			// Ensure newer blackboard structures exist on older workspaces.
+			if bm.bb.SystemModel == nil {
+				bm.bb.SystemModel = NewSystemModel()
+			}
+			ensureAssumptionHolder(bm.bb)
 			bm.publish(event.CerebrumResumed, map[string]any{
 				"target": bm.bb.Target,
 				"round":  bm.bb.Round,
@@ -140,6 +145,13 @@ func (bm *BlackboardManager) UpdateHypothesis(id string, updates map[string]any)
 				h.Evidence = append(h.Evidence, s)
 				changed = true
 			}
+		case "falsification_attempts":
+			if n, ok := v.(int); ok {
+				if h.FalsificationAttempts != n {
+					h.FalsificationAttempts = n
+					changed = true
+				}
+			}
 		}
 	}
 	if !changed {
@@ -206,6 +218,55 @@ func (bm *BlackboardManager) UpdateTask(id string, status TaskStatus, result, er
 	bm.bb.touch()
 	bm.persistLocked()
 	bm.publish(event.TaskUpdated, taskPayload(t))
+	return nil
+}
+
+// MarkTaskFalsification marks a task as a falsification attempt for its
+// associated hypothesis. This is used by the falsification orchestrator to
+// distinguish disproof tasks from normal verification tasks.
+func (bm *BlackboardManager) MarkTaskFalsification(id string) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	t, ok := bm.bb.Tasks[id]
+	if !ok {
+		return fmt.Errorf("task %s not found", id)
+	}
+	t.Falsification = true
+	bm.bb.touch()
+	bm.persistLocked()
+	return nil
+}
+
+// MarkTaskExplorationTarget records that a task was created to explore a
+// specific target area with no pre-existing hypothesis.
+func (bm *BlackboardManager) MarkTaskExplorationTarget(id, target string) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	t, ok := bm.bb.Tasks[id]
+	if !ok {
+		return fmt.Errorf("task %s not found", id)
+	}
+	t.ExplorationTarget = target
+	bm.bb.touch()
+	bm.persistLocked()
+	return nil
+}
+
+// MarkTaskTargetAssumption records that a task was created to test a specific
+// assumption from the system model.
+func (bm *BlackboardManager) MarkTaskTargetAssumption(id, assumptionID string) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	t, ok := bm.bb.Tasks[id]
+	if !ok {
+		return fmt.Errorf("task %s not found", id)
+	}
+	t.TargetAssumptionID = assumptionID
+	bm.bb.touch()
+	bm.persistLocked()
 	return nil
 }
 

@@ -18,7 +18,10 @@ type Scanner interface {
 // if no binary path is known at configuration time it will be re-discovered
 // against the target directory's bin/ and PATH when Scan is called.
 func All(cfg *config.Config) []Scanner {
-	scanners := []Scanner{NewSemanticScanner()}
+	scanners := []Scanner{
+		NewSemanticScanner(),
+		core.NewAnomalyScanner(),
+	}
 	osv := NewOSVScanner("")
 	if path, ok, _ := resolveOSVScanner(cfg); ok {
 		osv.Path = path

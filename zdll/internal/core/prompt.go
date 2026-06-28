@@ -93,6 +93,23 @@ Wrap the JSON in a markdown code block:
       "evidence": "Concrete code snippet proving the vulnerability"
     }
   ],
+  "system_model": {
+    "trust_boundaries": [
+      {"id": "b1", "name": "HTTP frontend", "description": "...", "trusted_side": "internal service", "untrusted_side": "internet"}
+    ],
+    "data_flows": [
+      {"id": "d1", "name": "file upload flow", "source": "HTTP multipart", "sinks": ["thumbnail generator"], "transforms": ["extension check", "MIME sniff"], "description": "..."}
+    ],
+    "invariants": [
+      {"id": "i1", "statement": "Uploaded file paths never reach shell commands", "evidence": "...", "tested": false}
+    ],
+    "overconfidence_zones": ["developers assume extension validation is sufficient"],
+    "anomalies": ["MIME sniffer and extension checker use different libraries"]
+  },
+  "untested_assumptions": [
+    "the upload directory is not reachable via HTTP",
+    "only authenticated users can reach /admin"
+  ],
   "critique": "Self-assessment: Am I repeating? Missing regions? Confidence calibrated?",
   "phase_complete": false,
   "is_complete": false,
@@ -105,6 +122,8 @@ Wrap the JSON in a markdown code block:
 - hypotheses: each MUST have claim, target, falsification, confidence (0.0-1.0). claim MUST be a positive assertion of vulnerability. NEVER use negative claims like "there is no vulnerability".
 - tasks: each MUST have hypothesis_ref, role, description. role MUST be one of: evidence-collector, data-flow-tracer, state-validator, topology-mapper, exploit-crafter, harness-generator, crash-analyzer, scope-definer, doc-analyst.
 - findings: ONLY populate when you have DIRECT CODE EVIDENCE. Each MUST have title, description, severity (critical|high|medium|low), confidence (>=0.75), evidence.
+- system_model: optional but STRONGLY encouraged. Update it every round as your understanding deepens. Include trust boundaries, data flows, critical invariants, overconfidence zones, and anomalies. Do not invent details you cannot support with the code or doc-intel you have seen.
+- untested_assumptions: list 1-3 concrete, testable assumptions your current reasoning relies on. The engine will dispatch drones to verify them. If you have none, you are not thinking deeply enough.
 - critique: free-form, never parsed.
 - phase_complete: boolean. Set true when the current phase's objectives are met or you are stuck; the engine will then advance to the next phase.
 - is_complete: boolean. Set true ONLY when all phases are exhausted and you have no productive actions left.

@@ -21,6 +21,7 @@ type RenderData struct {
 	Timestamp                 string                 `json:"timestamp"`
 	ElapsedSeconds            float64                `json:"elapsed_seconds"`
 	Summary                   map[string]any         `json:"summary"`
+	SystemModel               *core.SystemModel      `json:"system_model,omitempty"`
 	Findings                  []*core.Finding        `json:"findings"`
 	ZeroDayFindings           []*core.Finding        `json:"zero_day_findings"`
 	DependencyVulnerabilities []*core.Finding        `json:"dependency_vulnerabilities"`
@@ -50,6 +51,7 @@ func BuildRenderData(bb *core.Blackboard, target string, elapsed time.Duration) 
 		Timestamp:                 time.Now().Format(time.RFC3339),
 		ElapsedSeconds:            elapsed.Seconds(),
 		Summary:                   bb.SummaryPayload(),
+		SystemModel:               bb.SystemModel,
 		Findings:                  findings,
 		ZeroDayFindings:           zeroDay,
 		DependencyVulnerabilities: depVulns,

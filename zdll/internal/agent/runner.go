@@ -255,7 +255,8 @@ func buildDroneSystemPrompt(role, workDir string) string {
 
 	b.WriteString(`[HARD CONSTRAINTS]
 `)
-	b.WriteString("1. Use grep_search / bash to prove findings with concrete code evidence.\n")
+	b.WriteString("1. Use grep_search / bash / python_analyze to prove findings with concrete code evidence.\n")
+	b.WriteString("   Use python_analyze for small local analysis tasks (AST parsing, counting call sites, simulating inputs).\n")
 	b.WriteString("2. NEVER run dangerous or destructive exploits (e.g. rm -rf, format drives).\n")
 	b.WriteString("3. Write PoC/exploit/report files ONLY to ./pocs/ under the working directory.\n")
 	b.WriteString("4. DO NOT start long-running servers or heavy frameworks unless instructed.\n")

@@ -93,6 +93,9 @@ func (r *SARIFRenderer) Render(bb *core.Blackboard, target string, elapsed time.
 						ExitCode:            0,
 					},
 				},
+				Properties: map[string]any{
+					"system_model": bb.SystemModel,
+				},
 			},
 		},
 	}
@@ -245,6 +248,7 @@ type sarifRun struct {
 	Tool        sarifTool         `json:"tool"`
 	Results     []sarifResult     `json:"results"`
 	Invocations []sarifInvocation `json:"invocations,omitempty"`
+	Properties  map[string]any    `json:"properties,omitempty"`
 }
 
 type sarifTool struct {

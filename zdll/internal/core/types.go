@@ -71,9 +71,10 @@ const (
 type FindingType string
 
 const (
-	FindingTypeZeroDay    FindingType = "zero_day"
-	FindingTypeDependency FindingType = "dependency_vuln"
-	FindingTypeSemantic   FindingType = "semantic_signal"
+	FindingTypeZeroDay       FindingType = "zero_day"
+	FindingTypeDependency    FindingType = "dependency_vuln"
+	FindingTypeSemantic      FindingType = "semantic_signal"
+	FindingTypeAnomalySignal FindingType = "anomaly_signal"
 )
 
 // ExploitPrerequisites mirrors Python ExploitPrerequisites.
@@ -96,17 +97,84 @@ func NewExploitPrerequisites() *ExploitPrerequisites {
 	}
 }
 
+// SystemModel captures Cerebrum's evolving understanding of the target system.
+// It is kept on the blackboard so that reasoning is cumulative and inspectable.
+type SystemModel struct {
+	TrustBoundaries     []Boundary   `json:"trust_boundaries,omitempty"`
+	DataFlows           []DataFlow   `json:"data_flows,omitempty"`
+	Invariants          []Invariant  `json:"invariants,omitempty"`
+	OverconfidenceZones []string     `json:"overconfidence_zones,omitempty"`
+	Anomalies           []string     `json:"anomalies,omitempty"`
+	UntestedAssumptions []Assumption `json:"untested_assumptions,omitempty"`
+}
+
+// Boundary describes a trust boundary in the system.
+type Boundary struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Description   string `json:"description"`
+	TrustedSide   string `json:"trusted_side"`
+	UntrustedSide string `json:"untrusted_side"`
+}
+
+// DataFlow describes how data enters, transforms, and exits the system.
+type DataFlow struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Source      string   `json:"source"`
+	Sinks       []string `json:"sinks,omitempty"`
+	Transforms  []string `json:"transforms,omitempty"`
+	Description string   `json:"description"`
+}
+
+// Invariant is a security-critical property the system relies on.
+type Invariant struct {
+	ID        string `json:"id"`
+	Statement string `json:"statement"`
+	Evidence  string `json:"evidence,omitempty"`
+	Tested    bool   `json:"tested"`
+}
+
+// AssumptionConclusion captures the outcome of an assumption verification.
+const (
+	AssumptionConclusionUntested = "untested"
+	AssumptionConclusionValid    = "valid"
+	AssumptionConclusionViolated = "violated"
+	AssumptionConclusionUnknown  = "unknown"
+)
+
+// Assumption is an untested belief that Cerebrum is relying on.
+type Assumption struct {
+	ID           string   `json:"id"`
+	Text         string   `json:"text"`
+	RoundCreated int      `json:"round_created"`
+	Tested       bool     `json:"tested"`
+	TestedBy     []string `json:"tested_by,omitempty"`
+	Conclusion   string   `json:"conclusion,omitempty"` // valid | violated | unknown | untested
+}
+
+// NewSystemModel creates an empty system model.
+func NewSystemModel() *SystemModel {
+	return &SystemModel{
+		TrustBoundaries:     make([]Boundary, 0),
+		DataFlows:           make([]DataFlow, 0),
+		Invariants:          make([]Invariant, 0),
+		UntestedAssumptions: make([]Assumption, 0),
+	}
+}
+
 // HypothesisNode mirrors Python HypothesisNode.
 type HypothesisNode struct {
-	ID          string           `json:"id"`
-	Description string           `json:"description"`
-	Confidence  float64          `json:"confidence"`
-	Status      HypothesisStatus `json:"status"`
-	Tasks       []string         `json:"tasks"`
-	Evidence    []string         `json:"evidence"`
-	ParentID    *string          `json:"parent_id,omitempty"`
-	CreatedAt   float64          `json:"created_at"`
-	Polarity    string           `json:"polarity"`
+	ID                    string           `json:"id"`
+	Description           string           `json:"description"`
+	Confidence            float64          `json:"confidence"`
+	Status                HypothesisStatus `json:"status"`
+	Tasks                 []string         `json:"tasks"`
+	Evidence              []string         `json:"evidence"`
+	ParentID              *string          `json:"parent_id,omitempty"`
+	CreatedAt             float64          `json:"created_at"`
+	Polarity              string           `json:"polarity"`
+	FalsificationAttempts int              `json:"falsification_attempts"`
 }
 
 func NewHypothesisNode(description string, confidence float64, parentID *string) *HypothesisNode {
@@ -125,16 +193,19 @@ func NewHypothesisNode(description string, confidence float64, parentID *string)
 
 // DroneTask mirrors Python DroneTask.
 type DroneTask struct {
-	ID           string     `json:"id"`
-	HypothesisID string     `json:"hypothesis_id"`
-	Description  string     `json:"description"`
-	Status       TaskStatus `json:"status"`
-	DroneRole    string     `json:"drone_role"`
-	Result       *string    `json:"result,omitempty"`
-	Error        *string    `json:"error,omitempty"`
-	CreatedAt    float64    `json:"created_at"`
-	CompletedAt  *float64   `json:"completed_at,omitempty"`
-	Integrated   bool       `json:"integrated,omitempty"`
+	ID                 string     `json:"id"`
+	HypothesisID       string     `json:"hypothesis_id"`
+	Description        string     `json:"description"`
+	Status             TaskStatus `json:"status"`
+	DroneRole          string     `json:"drone_role"`
+	Result             *string    `json:"result,omitempty"`
+	Error              *string    `json:"error,omitempty"`
+	CreatedAt          float64    `json:"created_at"`
+	CompletedAt        *float64   `json:"completed_at,omitempty"`
+	Integrated         bool       `json:"integrated,omitempty"`
+	Falsification      bool       `json:"falsification,omitempty"`
+	TargetAssumptionID string     `json:"target_assumption_id,omitempty"`
+	ExplorationTarget  string     `json:"exploration_target,omitempty"`
 }
 
 func NewDroneTask(hypothesisID, description, role string) *DroneTask {
@@ -170,6 +241,7 @@ type Finding struct {
 	PoCOutput      *string               `json:"poc_output,omitempty"`
 	PoCVerifiedAt  *float64              `json:"poc_verified_at,omitempty"`
 	Prerequisites  *ExploitPrerequisites `json:"prerequisites,omitempty"`
+	Confidence     float64               `json:"confidence,omitempty"`
 	FindingType    FindingType           `json:"finding_type"`
 	CVEID          string                `json:"cve_id"`
 	PackageName    string                `json:"package_name"`
@@ -219,6 +291,7 @@ type Blackboard struct {
 	Hypotheses   map[string]*HypothesisNode `json:"hypotheses"`
 	Tasks        map[string]*DroneTask      `json:"tasks"`
 	Findings     []*Finding                 `json:"findings"`
+	SystemModel  *SystemModel               `json:"system_model,omitempty"`
 	Round        int                        `json:"round"`
 	TotalTasks   int                        `json:"total_tasks"`
 	CreatedAt    float64                    `json:"created_at"`
@@ -229,16 +302,19 @@ type Blackboard struct {
 
 func NewBlackboard(target string) *Blackboard {
 	now := float64(time.Now().UnixMilli()) / 1000.0
-	return &Blackboard{
-		Target:     target,
-		Active:     true,
-		Hypotheses: make(map[string]*HypothesisNode),
-		Tasks:      make(map[string]*DroneTask),
-		Findings:   []*Finding{},
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		Engine:     version.Engine,
+	bb := &Blackboard{
+		Target:      target,
+		Active:      true,
+		Hypotheses:  make(map[string]*HypothesisNode),
+		Tasks:       make(map[string]*DroneTask),
+		Findings:    []*Finding{},
+		SystemModel: NewSystemModel(),
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		Engine:      version.Engine,
 	}
+	ensureAssumptionHolder(bb)
+	return bb
 }
 
 // Stats returns summary counts.
@@ -248,6 +324,11 @@ func (bb *Blackboard) Stats() map[string]int {
 	pending := 0
 	suspected := 0
 	for _, h := range bb.Hypotheses {
+		// The assumption holder is a meta hypothesis and should not be counted
+		// in user-facing statistics.
+		if h.ID == assumptionHolderID {
+			continue
+		}
 		switch h.Status {
 		case HypothesisConfirmed:
 			confirmed++
@@ -277,8 +358,12 @@ func (bb *Blackboard) Stats() map[string]int {
 			tasksExecuted++
 		}
 	}
+	totalHypotheses := len(bb.Hypotheses)
+	if _, ok := bb.Hypotheses[assumptionHolderID]; ok {
+		totalHypotheses--
+	}
 	return map[string]int{
-		"total_hypotheses":  len(bb.Hypotheses),
+		"total_hypotheses":  totalHypotheses,
 		"confirmed":         confirmed,
 		"discarded":         discarded,
 		"pending":           pending,
