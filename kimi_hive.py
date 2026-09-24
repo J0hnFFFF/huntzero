@@ -44,16 +44,10 @@ except ImportError:
 # workaround is active before kimi_agent_sdk / kimi_cli are loaded.
 from kimi_sdk_compat import patch_kimi_agent_sdk
 
-try:
-    from kimi_agent_sdk import Config
-except ImportError:
-    print("❌ Missing dep: pip install kimi-agent-sdk")
-    sys.exit(1)
-
 patch_kimi_agent_sdk()
 
-from engine import Blackboard, Cerebrum
-from engine.drone import Drone
+from engine import Blackboard, Cerebrum, Drone
+from engine.llm_config import build_llm_config as build_config
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  全局 Console（stderr 用于日志，stdout 保持干净可 pipe）
@@ -669,28 +663,6 @@ async def prepare_git_target(url: str, work_dir: Path) -> Optional[Path]:
 
     console.print(f"[green]✅ Ready → {target_dir}[/]")
     return target_dir
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Config 构建
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_config(api_key: str) -> Config:
-    base_url = os.environ.get("KIMI_BASE_URL", "https://api.kimi.com/coding/v1")
-    return Config(
-        default_model="kimi-for-coding",
-        providers={"kimi": {
-            "type":     "kimi",
-            "base_url": base_url,
-            "api_key":  api_key,
-            "timeout":  3600.0,
-        }},
-        models={"kimi-for-coding": {
-            "provider":        "kimi",
-            "model":           "kimi-for-coding",
-            "max_context_size": 262144,
-        }},
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
