@@ -432,6 +432,17 @@ class TerminationGuard:
         )
 
 
+def _compute_sector_budget(file_count: int, priority: int) -> tuple[int, int]:
+    """根据 sector 优先级和文件数量动态调整预算。
+
+    高优先级 sector（P0/P1）和文件数多的 sector 获得更多预算。
+    """
+    multiplier = {0: 1.5, 1: 1.2, 2: 1.0, 3: 0.8}.get(priority, 1.0)
+    budget_tasks = int(max(40, min(120, file_count * 0.8)) * multiplier)
+    budget_rounds = int(max(10, min(25, budget_tasks // 4)))
+    return budget_tasks, budget_rounds
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Cerebrum Class
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2024,7 +2035,6 @@ class Cerebrum:
                 t_id = await self.blackboard.add_task(h_id, desc, role)
                 if t_id:  # 如果被 deduplication 拦截会返回 None
                     await self._task_queue.put(t_id)
-                    self._total_tasks += 1
                     await self._emit("task_queued", {"id": t_id, "role": role})
                 else:
                     pass # 减少垃圾日志输出
@@ -2200,9 +2210,9 @@ class Cerebrum:
                 h_id = pending[-1].id if pending else list(self.blackboard.hypotheses.keys())[-1]
             if h_id and task_desc:
                 t_id = await self.blackboard.add_task(h_id, task_desc, role)
-                await self._task_queue.put(t_id)
-                self._total_tasks += 1
-                await self._emit("task_queued", {"id": t_id, "role": role})
+                if t_id:  # 如果被 deduplication 拦截会返回 None
+                    await self._task_queue.put(t_id)
+                    await self._emit("task_queued", {"id": t_id, "role": role})
 
         # 完成信号（带 CRITIQUE 隔离防泄漏）
         text_clean = re.sub(r'<CRITIQUE>.*?</CRITIQUE>', '', text, flags=re.DOTALL | re.IGNORECASE)
@@ -2821,12 +2831,12 @@ class Cerebrum:
                         description=poc_desc,
                         drone_role="evidence-collector",
                     )
-                    await self._task_queue.put(poc_task_id)
-                    self._total_tasks += 1
-                    await self._emit("poc_dispatched", {
-                        "task_id": poc_task_id,
-                        "finding_title": parsed.get("finding", ""),
-                    })
+                    if poc_task_id:
+                        await self._task_queue.put(poc_task_id)
+                        await self._emit("poc_dispatched", {
+                            "task_id": poc_task_id,
+                            "finding_title": parsed.get("finding", ""),
+                        })
 
                     # FIX(Root Cause 9): Devil's Advocate Drone — 专职证伪
                     falsify_desc = (
@@ -2853,12 +2863,12 @@ class Cerebrum:
                         description=falsify_desc,
                         drone_role="evidence-collector",
                     )
-                    await self._task_queue.put(falsify_task_id)
-                    self._total_tasks += 1
-                    await self._emit("devils_advocate_dispatched", {
-                        "task_id": falsify_task_id,
-                        "finding_title": parsed.get("finding", ""),
-                    })
+                    if falsify_task_id:
+                        await self._task_queue.put(falsify_task_id)
+                        await self._emit("devils_advocate_dispatched", {
+                            "task_id": falsify_task_id,
+                            "finding_title": parsed.get("finding", ""),
+                        })
 
             else:
                 # ── 负面结果：Drone 未发现问题 ──
@@ -3115,10 +3125,9 @@ class Cerebrum:
 
         # 根据 sector 优先级和文件数量动态调整预算
         # 高优先级 sector（P0/P1）和文件数多的 sector 获得更多预算
-        sector_file_count = getattr(sector, 'file_count', 0) or 50
-        priority_multiplier = {0: 1.5, 1: 1.2, 2: 1.0, 3: 0.8}.get(sector.priority, 1.0)
-        budget_tasks = int(max(40, min(120, sector_file_count * 0.8)) * priority_multiplier)
-        budget_rounds = int(max(10, min(25, budget_tasks // 4)))
+        budget_tasks, budget_rounds = _compute_sector_budget(
+            sector.estimated_files or 50, sector.priority
+        )
 
         # 创建独立的 Mini-Cerebrum 实例
         mini_cerebrum = Cerebrum(
