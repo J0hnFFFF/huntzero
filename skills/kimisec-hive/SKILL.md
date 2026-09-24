@@ -1,12 +1,12 @@
 ---
 name: kimisec-hive
 description: >
-  Autonomous distributed security analysis powered by kimiSec Hive-Mind Engine.
+  Autonomous distributed security analysis powered by huntzero Engine.
   Uses first-principles reasoning and parallel drone workers to discover
   logical contradictions, state anomalies, and unbound resource access in
   any target codebase or service — without predefined vulnerability checklists.
 version: "7.1.0"
-author: kimiSec Team
+author: huntzero Team
 tools:
   - start_analysis
   - get_status
@@ -19,11 +19,11 @@ mcp_server:
     KIMI_API_KEY: "{{env.KIMI_API_KEY}}"
 ---
 
-# kimiSec Hive-Mind — Security Analysis Engine
+# huntzero — Security Analysis Engine
 
 ## What This Skill Does
 
-This skill gives you access to **kimiSec**, an autonomous AI security analysis engine.
+This skill gives you access to **huntzero**, an autonomous AI security analysis engine.
 It does NOT use predefined checklists. Instead, it reasons from first principles to find:
 
 - **Logical Contradictions** — The system claims property X, but code shows ¬X
@@ -41,7 +41,7 @@ Use `start_analysis` when:
 
 ### `start_analysis(target, ...)`
 
-Launches autonomous Hive-Mind analysis. Returns immediately; analysis runs in background.
+Launches autonomous huntzero analysis. Returns immediately; analysis runs in background.
 
 **Arguments:**
 - `target` (required): GitHub URL or absolute local path
@@ -83,7 +83,7 @@ Gracefully stops the running analysis. All findings discovered so far are preser
    start_analysis("https://github.com/example/app", max_workers=5)
 
 3. Tell the user:
-   "Analysis started. The Hive-Mind engine is now autonomously exploring the codebase.
+   "Analysis started. The huntzero engine is now autonomously exploring the codebase.
     I'll check back in a minute."
 
 4. After ~60 seconds, call get_status() and report progress to user.

@@ -2588,7 +2588,7 @@ class Cerebrum:
         hyp_claim = hypothesis.description if hypothesis else "N/A"
 
         prompt = (
-            f"You are the KimiSec CRITIC AGENT (L5 Adversarial Reflection Module).\n"
+            f"You are the huntzero CRITIC AGENT (L5 Adversarial Reflection Module).\n"
             f"A Drone researcher claims to have found a vulnerability.\n\n"
             f"## Claim\n"
             f"Hypothesis: {hyp_claim}\n"
@@ -3133,7 +3133,7 @@ class Cerebrum:
         mini_cerebrum = Cerebrum(
             blackboard=partition,       # 使用隔离的分区视图
             work_dir=sector_work_dir,   # 收窄到 Sector 目录
-            root_dir=self.root_dir,     # KimiSec 引擎根目录，用于加载 skills
+            root_dir=self.root_dir,     # huntzero 引擎根目录，用于加载 skills
             config=self.config,
             telemetry_queue=self.telemetry,  # 必须继承遥测队列
             max_concurrent_drones=2,    # Sector 级并发更少
@@ -3216,7 +3216,7 @@ class Cerebrum:
                 task_desc=cross_prompt,
                 drone_role="semantic-analyzer",
                 work_dir=project_root,
-                root_dir=self.root_dir,  # KimiSec 引擎根目录
+                root_dir=self.root_dir,  # huntzero 引擎根目录
                 config=self.config,
             )
             result = await asyncio.wait_for(drone.execute(), timeout=300.0)

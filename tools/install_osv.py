@@ -9,7 +9,7 @@
 
 安装后可通过以下方式使用:
     export OSV_SCANNER_PATH=./bin/osv-scanner
-    python kimi.py scan ./my-project
+    python huntzero.py scan ./my-project
 """
 
 import argparse
@@ -123,7 +123,7 @@ def download_osv_scanner(version: str, dest_dir: Path) -> Path:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Install OSV-Scanner for kimiSec")
+    parser = argparse.ArgumentParser(description="Install OSV-Scanner for huntzero")
     parser.add_argument(
         "--version",
         default="v2.3.8",

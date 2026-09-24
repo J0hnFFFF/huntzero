@@ -35,7 +35,7 @@ dev = [
 ]
 
 [project.scripts]
-huntzero = "kimi:main"
+huntzero = "huntzero:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -43,7 +43,7 @@ include = ["engine*", "tools*"]
 exclude = ["tests*", "docs*", "skills*"]
 
 [tool.setuptools]
-py-modules = ["kimi", "kimi_hive", "kimi_sdk_compat"]
+py-modules = ["huntzero", "kimi_hive", "kimi_sdk_compat"]
 
 [tool.black]
 line-length = 100

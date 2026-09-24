@@ -269,7 +269,7 @@ WHERE id = ? AND version = ?;
 
 **项目**: [项目名称]
 **审计日期**: [日期]
-**审计工具**: KimiSec Web Analyzer
+**审计工具**: huntzero Web Analyzer
 **报告版本**: v1.0
 
 ---

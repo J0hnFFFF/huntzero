@@ -1,4 +1,4 @@
-# Hive-Mind Engine Package
+# huntzero Engine Package
 from .blackboard import Blackboard, BlackboardPartition, HypothesisStatus, TaskStatus, HypothesisNode, DroneTask, Finding
 from .drone import Drone
 from .cerebrum import Cerebrum, SectorContext

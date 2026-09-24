@@ -1,5 +1,5 @@
 """
-Global Blackboard — Hive-Mind 的唯一共享状态中心。
+Global Blackboard — huntzero 的唯一共享状态中心。
 Cerebrum 和所有 Drone 只通过 Blackboard 通信，无直接耦合。
 线程/协程安全的异步读写。
 """
@@ -966,7 +966,7 @@ class Blackboard:
 
     def _write_audit_notes(self):
         """将 Findings 汇总写到后端可见的位置（文件 / Redis Key）。"""
-        lines = ["# 🔴 HIVE-MIND CONFIRMED FINDINGS\n"]
+        lines = ["# 🔴 HUNTZERO CONFIRMED FINDINGS\n"]
         for f in self.findings:
             sev_icon = {
                 "critical": "🔴", "high": "🟠",

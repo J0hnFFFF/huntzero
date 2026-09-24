@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-kimi.py — huntzero 统一入口。
+huntzero.py — huntzero 统一入口。
 
 纯 CLI 扫描器，唯一子命令：
 
-    python kimi.py scan <target>         单次分析（替代 kimi_hive.py）
+    python huntzero.py scan <target>     单次分析（替代 kimi_hive.py）
 """
 
 import argparse
@@ -62,7 +62,7 @@ async def cmd_scan(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="kimi",
+        prog="huntzero",
         description="huntzero — Autonomous LLM-Dominant Security Analysis",
     )
     sub = parser.add_subparsers(dest="command", help="Available commands")

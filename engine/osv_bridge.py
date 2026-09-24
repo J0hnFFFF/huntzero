@@ -1,6 +1,6 @@
 """
 OSV-Scanner Bridge — 将 Google OSV-Scanner 的依赖漏洞扫描结果
-无缝整合进 kimiSec 的 Blackboard / Cerebrum 管线。
+无缝整合进 huntzero 的 Blackboard / Cerebrum 管线。
 
 职责：
   1. 探测/调用 osv-scanner 二进制

@@ -1,5 +1,5 @@
 """
-HIVE-MIND INTEL ENGINE [V8.0-HEADLESS]
+HUNTZERO INTEL ENGINE [V8.0-HEADLESS]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 纯 CLI 无 TUI 版本。
@@ -463,7 +463,7 @@ def _build_report_data(blackboard: Blackboard, target: str, elapsed: float) -> d
     all_findings = zero_day_findings + dep_vuln_findings
 
     return {
-        "engine": "HIVE-MIND INTEL ENGINE V8.0",
+        "engine": "HUNTZERO INTEL ENGINE V8.0",
         "target": target,
         "timestamp": datetime.now().isoformat(),
         "elapsed_seconds": round(elapsed, 1),
@@ -682,7 +682,7 @@ async def run(target: str, work_dir: Path, root_dir: Path,
     # ── 打印 Banner ──
     mode_label = "[green]UNATTENDED[/]" if auto_approve else "[yellow]INTERACTIVE[/]"
     console.print(Panel(
-        f"[bold cyan]HIVE-MIND INTEL ENGINE[/]  [dim]V8.0-HEADLESS[/]\n"
+        f"[bold cyan]HUNTZERO INTEL ENGINE[/]  [dim]V8.0-HEADLESS[/]\n"
         f"[dim]Autonomous · Distributed-Ready · LLM-Dominant[/]\n"
         f"Mode: {mode_label}",
         border_style="cyan",
@@ -896,7 +896,7 @@ async def run(target: str, work_dir: Path, root_dir: Path,
 def main():
     parser = argparse.ArgumentParser(
         prog="kimi_hive",
-        description="HIVE-MIND INTEL ENGINE — Autonomous LLM-Dominant Analysis",
+        description="HUNTZERO INTEL ENGINE — Autonomous LLM-Dominant Analysis",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

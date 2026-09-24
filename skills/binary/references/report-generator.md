@@ -160,7 +160,7 @@ afl-fuzz -i corpus/ -o out/ ./target @@
 
 **项目**: [产品名/版本]
 **审计日期**: [日期]
-**审计工具**: KimiSec Binary Analyzer + rizin + pwndbg
+**审计工具**: huntzero Binary Analyzer + rizin + pwndbg
 **报告版本**: v1.0
 
 ---

@@ -1,5 +1,5 @@
 """
-tools/finops_monitor.py — kimiSec FinOps 实时遥测与成本监控
+tools/finops_monitor.py — huntzero FinOps 实时遥测与成本监控
 
 功能：
   1. 记录每次 LLM 调用的 token 估算与成本
@@ -217,7 +217,7 @@ class FinOpsMonitor:
             from rich.table import Table
             from rich import box
 
-            table = Table(title="⚡ kimiSec FinOps Report", box=box.ROUNDED)
+            table = Table(title="⚡ huntzero FinOps Report", box=box.ROUNDED)
             table.add_column("指标", style="cyan")
             table.add_column("数值", style="green")
             table.add_column("备注", style="dim")
