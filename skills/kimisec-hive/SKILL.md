@@ -12,11 +12,6 @@ tools:
   - get_status
   - get_findings
   - stop_analysis
-mcp_server:
-  command: python
-  args: ["{{SKILL_DIR}}/../../kimi_mcp_server.py"]
-  env:
-    KIMI_API_KEY: "{{env.KIMI_API_KEY}}"
 ---
 
 # huntzero — Security Analysis Engine

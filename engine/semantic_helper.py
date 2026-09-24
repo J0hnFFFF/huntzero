@@ -719,7 +719,7 @@ def cmd_call_graph(args):
         "cpp":        f'[(function_declaration declarator: (identifier) @fn (#eq? @fn "{fn_name}")) (function_definition declarator: (identifier) @fn (#eq? @fn "{fn_name}")) (method_declaration name: (field_identifier) @fn (#eq? @fn "{fn_name}"))] @def',
     }
 
-    callers, callees, definitions = [], [], []
+    callers, definitions = [], []
     call_q_str = call_site_queries.get(args.lang)
     def_q_str  = def_queries.get(args.lang)
 
@@ -1153,7 +1153,7 @@ def _run_analysis_command(cmd: str, argv: list[str]) -> None:
         parser.add_argument("--lang",      "-l", required=True, choices=list(LANG_MAP))
         parser.add_argument("--function",  "-f", required=True)
         parser.add_argument("--direction", "-d", default="both",
-                            choices=["callers", "callees", "both"])
+                            choices=["callers", "both"])
         parser.set_defaults(func=cmd_call_graph)
     elif cmd == "scope_extract":
         parser.add_argument("--target", "-t", required=True)
