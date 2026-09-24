@@ -1,10 +1,10 @@
-#kimi-agent-sdk 
+# 依赖唯一权威是 pyproject.toml（SPEC 5.2）。
+# 本文件仅为兼容旧工作流的导出快照，更新方式：
+#   pip install -e . && pip freeze --exclude-editable > requirements.txt
+# 新增/修改依赖请改 pyproject.toml，不要直接编辑本文件。
+kimi-agent-sdk==0.0.5
 rich>=13.0
 pyyaml>=6.0
-redis[asyncio]>=5.0
-fastapi>=0.115
-uvicorn[standard]>=0.30
-pydantic>=2.0
 tree-sitter>=0.23
 tree-sitter-python
 tree-sitter-javascript
