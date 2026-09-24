@@ -345,7 +345,7 @@ class TerminationGuard:
     Layer 2  假设树收敛        所有假设 = 终态 + 所有队列空 + 无活跃 Drone
     Layer 3  停滞检测          连续 stagnation_rounds 轮无新 Finding 确认
     Layer 4  预算守卫          超 max_rounds / max_tasks / max_wall_time
-    Layer 5  硬性安全网        由外部 asyncio.wait_for 保证，不在此实现
+    Layer 5  硬性安全网        传输层兜底：httpx 读超时(600s/次)×SDK 重试(APITimeoutError → 主循环 break → 轮边界 L4 判定)，挂死请求有界（最坏 ~数十分钟），非逐轮硬墙
     """
     max_rounds:        int   = 30      # 最多推理轮数
     max_tasks:         int   = 200     # 最多派发任务数
