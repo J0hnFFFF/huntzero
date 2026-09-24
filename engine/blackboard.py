@@ -416,7 +416,7 @@ class Blackboard:
 
     可选 backend 参数支持可插拔存储后端：
       - 不传（默认）：自动使用 LocalBackend，写本地 .blackboard.json
-      - 传入 RedisBackend：将快照同步到 Redis，并向全局 Pub/Sub 广播事件
+      - 传入自定义 StorageBackend 实现：接管快照持久化与事件发布
     """
 
     def __init__(

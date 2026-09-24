@@ -3,12 +3,12 @@ from .blackboard import Blackboard, BlackboardPartition, HypothesisStatus, TaskS
 from .drone import Drone
 from .cerebrum import Cerebrum, SectorContext
 from .sector import Sector, SectorManager
-from .backends import StorageBackend, LocalBackend, RedisBackend, make_backend
+from .backends import StorageBackend, LocalBackend
 
 __all__ = [
     "Blackboard", "BlackboardPartition", "HypothesisStatus", "TaskStatus",
     "HypothesisNode", "DroneTask", "Finding",
     "Drone", "Cerebrum", "SectorContext",
     "Sector", "SectorManager",
-    "StorageBackend", "LocalBackend", "RedisBackend", "make_backend",
+    "StorageBackend", "LocalBackend",
 ]

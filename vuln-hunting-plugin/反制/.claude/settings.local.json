@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebFetch(domain:antigravity.google)",
-      "WebFetch(domain:blog.einverne.info)",
-      "WebFetch(domain:juejin.cn)"
-    ]
-  }
-}
