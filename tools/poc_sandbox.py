@@ -191,7 +191,10 @@ class DockerSandbox:
 
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd, env=env
+                    *cmd,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
                 try:
                     stdout, stderr = await asyncio.wait_for(
