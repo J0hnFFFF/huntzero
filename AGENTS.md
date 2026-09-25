@@ -11,7 +11,7 @@ huntzero — LLM 主导的假设驱动漏洞挖掘引擎（纯 CLI，Proprietary
 - `skills/`：领域 playbook，按目标类型加载（小写 kebab 目录名）。
 - `tools/`：`check_env_sync.py`（env 同步门禁）、`install_osv.py`、`poc_sandbox.py`、`exploit_analyzer.py`、`finops_monitor.py`、`build_cython.sh`（Cython 编译管线）。
 - `tests/`：pytest 套件 + `fake_llm.py` 集成 harness + `fixture_proj/`。
-- `docs/`：`design/` 设计文档、`suspicious-registry.md` 疑似 bug 登记册、`cython-spike.md` 编译结论。
+- `docs/`：`design/` 设计文档、`suspicious-registry.md` 疑似 bug 登记册、`cython-spike.md` 编译结论、`architecture.md` 架构详解（维护者向）、`usage.md` 使用指南（操作者向）。
 - 运行时产物（`local_workspace/`、`tmp/`、reports、`.blackboard*.json`、`.audit_notes.md`、`build/` 等）不入库。
 
 ## Build, Test, and Development Commands
